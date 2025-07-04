@@ -10,29 +10,16 @@ if (-not ([Security.Principal.WindowsPrincipal] `
 
 Write-Host "✅ Running as Administrator"
 
-# Ensure GitHub CLI
-if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
-    Write-Host "📦 GitHub CLI not found. Installing..."
-
-    $msiPath = "$env:TEMP\gh.msi"
-    Invoke-WebRequest -Uri https://github.com/cli/cli/releases/download/v2.50.0/gh_2.50.0_windows_amd64.msi -OutFile $msiPath
-    Start-Process msiexec.exe -Wait -ArgumentList "/i `"$msiPath`" /quiet"
-
-    Write-Host "✅ GitHub CLI installed. Restarting script..."
-
-    # Re-run the script after install
-    Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile", "-ExecutionPolicy Bypass", "-File `"$PSCommandPath`""
-    exit
-} else {
-    Write-Host "✅ GitHub CLI found"
-}
-
-# Fetch latest staging release tag
+# Fetch latest staging release tag via GitHub API
 $repo = "Care-AI-Inc/careai-corina-service-staging-releases"
-$latestTag = gh release list --repo $repo --limit 1 | ForEach-Object { ($_ -split "\s+")[0] }
+$latestReleaseApi = "https://api.github.com/repos/$repo/releases/latest"
+$headers = @{ "User-Agent" = "CorinaServiceInstaller" }
 
-if (-not $latestTag) {
-    Write-Error "❌ Failed to get latest release tag"
+try {
+    $response = Invoke-RestMethod -Uri $latestReleaseApi -Headers $headers
+    $latestTag = $response.tag_name
+} catch {
+    Write-Error "❌ Failed to get latest release info from GitHub API"
     exit 1
 }
 
