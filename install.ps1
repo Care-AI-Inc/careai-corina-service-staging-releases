@@ -13,9 +13,22 @@ Write-Host "✅ Running as Administrator"
 # Ensure GitHub CLI
 if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
     Write-Host "📦 GitHub CLI not found. Installing..."
+
     $msiPath = "$env:TEMP\gh.msi"
     Invoke-WebRequest -Uri https://github.com/cli/cli/releases/download/v2.50.0/gh_2.50.0_windows_amd64.msi -OutFile $msiPath
+
     Start-Process msiexec.exe -Wait -ArgumentList "/i `"$msiPath`" /quiet"
+
+    # Reload PATH so gh is found immediately
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
+                [System.Environment]::GetEnvironmentVariable("Path", "User")
+
+    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+        Write-Error "❌ GitHub CLI install failed or not found in PATH"
+        exit 1
+    }
+
+    Write-Host "✅ GitHub CLI installed"
 } else {
     Write-Host "✅ GitHub CLI found"
 }
