@@ -1,5 +1,3 @@
-# install.ps1
-
 # Ensure Admin
 if (-not ([Security.Principal.WindowsPrincipal] `
     [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(`
@@ -10,26 +8,26 @@ if (-not ([Security.Principal.WindowsPrincipal] `
 
 Write-Host "✅ Running as Administrator"
 
-# Fetch latest staging release tag via GitHub API
+# Get latest release from GitHub API
 $repo = "Care-AI-Inc/careai-corina-service-staging-releases"
-$latestReleaseApi = "https://api.github.com/repos/$repo/releases/latest"
+$apiUrl = "https://api.github.com/repos/$repo/releases/latest"
 $headers = @{ "User-Agent" = "CorinaServiceInstaller" }
 
 try {
-    $response = Invoke-RestMethod -Uri $latestReleaseApi -Headers $headers
+    $response = Invoke-RestMethod -Uri $apiUrl -Headers $headers
     $latestTag = $response.tag_name
+    $zipAsset = $response.assets | Where-Object { $_.name -like '*.zip' } | Select-Object -First 1
+    $zipUrl = $zipAsset.browser_download_url
+    $zipName = $zipAsset.name
 } catch {
-    Write-Error "❌ Failed to get latest release info from GitHub API"
+    Write-Error "❌ Failed to fetch release or asset info from GitHub"
     exit 1
 }
 
-Write-Host "⬇ Downloading release $latestTag from $repo"
+Write-Host "⬇ Downloading $zipName from $zipUrl"
 
 # Download the ZIP
-$zipName = "$latestTag.zip"
-$zipUrl = "https://github.com/$repo/releases/download/$latestTag/$zipName"
 $zipPath = "$env:TEMP\$zipName"
-
 Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath
 
 # Extract to Program Files
@@ -40,6 +38,11 @@ Expand-Archive -Path $zipPath -DestinationPath $installDir
 # Install as Windows Service
 $exePath = Join-Path $installDir "careai-corina-service.exe"
 $serviceName = "CorinaService"
+
+if (-not (Test-Path $exePath)) {
+    Write-Error "❌ Failed to find service executable at $exePath"
+    exit 1
+}
 
 # Remove old service if exists
 if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
