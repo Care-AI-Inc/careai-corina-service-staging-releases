@@ -6,12 +6,12 @@ if (-not ([Security.Principal.WindowsPrincipal] `
     exit 1
 }
 
-Write-Host "✅ Running as Administrator"
+Write-Host "✅ Running as Administrator (Staging Installer)"
 
-# Get latest release from GitHub API
+# Get latest staging release from GitHub API
 $repo = "Care-AI-Inc/careai-corina-service-staging-releases"
 $apiUrl = "https://api.github.com/repos/$repo/releases/latest"
-$headers = @{ "User-Agent" = "CorinaServiceInstaller" }
+$headers = @{ "User-Agent" = "CorinaServiceStagingInstaller" }
 
 try {
     $response = Invoke-RestMethod -Uri $apiUrl -Headers $headers
@@ -20,24 +20,24 @@ try {
     $zipUrl = $zipAsset.browser_download_url
     $zipName = $zipAsset.name
 } catch {
-    Write-Error "❌ Failed to fetch release or asset info from GitHub"
+    Write-Error "❌ Failed to fetch staging release or asset info from GitHub"
     exit 1
 }
 
-Write-Host "⬇ Downloading $zipName from $zipUrl"
+Write-Host "⬇ Downloading staging ZIP: $zipName from $zipUrl"
 
 # Download the ZIP
 $zipPath = "$env:TEMP\$zipName"
 Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath
 
-# Extract to Program Files
-$installDir = Join-Path ${env:ProgramFiles} "CorinaService"
+# Extract to Program Files (Staging Path)
+$installDir = Join-Path ${env:ProgramFiles} "CorinaService_Staging"
 if (Test-Path $installDir) { Remove-Item -Recurse -Force $installDir }
 Expand-Archive -Path $zipPath -DestinationPath $installDir
 
-# Install as Windows Service
+# Install as Windows Service (Staging version)
 $exePath = Join-Path $installDir "careai-corina-service.exe"
-$serviceName = "CorinaService"
+$serviceName = "CorinaService_Staging"
 
 if (-not (Test-Path $exePath)) {
     Write-Error "❌ Failed to find service executable at $exePath"
@@ -51,10 +51,10 @@ if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
     Start-Sleep -Seconds 2
 }
 
-# Register service
-sc.exe create $serviceName binPath= "`"$exePath`"" start= auto DisplayName= "Corina Service"
+# Register the staging service
+sc.exe create $serviceName binPath= "`"$exePath`"" start= auto DisplayName= "Corina Service (Staging)"
 
-# Start service
+# Start the service
 Start-Service -Name $serviceName
 
-Write-Host "🎉 Corina Service installed and started successfully!"
+Write-Host "🎉 Corina Service (Staging) installed and started successfully!"
