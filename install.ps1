@@ -32,6 +32,7 @@ Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath
 
 # Extract to Program Files (Staging Path)
 $installDir = Join-Path ${env:ProgramFiles} "CorinaService_Staging"
+$serviceName = "CorinaService_Staging"
 
 # Stop and remove old service if exists
 if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
@@ -63,7 +64,6 @@ Expand-Archive -Path $zipPath -DestinationPath $installDir
 
 # Install as Windows Service (Staging version)
 $exePath = Join-Path $installDir "careai-corina-service.exe"
-$serviceName = "CorinaService_Staging"
 
 if (-not (Test-Path $exePath)) {
     Write-Error "❌ Failed to find service executable at $exePath"
