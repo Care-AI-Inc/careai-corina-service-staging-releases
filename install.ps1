@@ -78,7 +78,7 @@ if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
 }
 
 # Register the staging service
-sc.exe create $serviceName binPath= "`"$exePath`"" start= auto obj= "LocalSystem" DisplayName= "Corina Service (Production)"
+sc.exe create $serviceName binPath= "`"$exePath`"" start= auto obj= "LocalSystem" DisplayName= "Corina Service (Staging)"
 
 # Start the service
 Start-Service -Name $serviceName
