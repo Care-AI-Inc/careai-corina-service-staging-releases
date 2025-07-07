@@ -32,7 +32,33 @@ Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath
 
 # Extract to Program Files (Staging Path)
 $installDir = Join-Path ${env:ProgramFiles} "CorinaService_Staging"
-if (Test-Path $installDir) { Remove-Item -Recurse -Force $installDir }
+
+# Stop and remove old service if exists
+if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
+    Write-Host "🛑 Stopping existing service..."
+    Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+
+    Write-Host "🧹 Deleting existing service..."
+    sc.exe delete $serviceName | Out-Null
+    Start-Sleep -Seconds 2
+
+    # Kill any lingering process just in case
+    Get-Process careai-corina-service -ErrorAction SilentlyContinue | Stop-Process -Force
+    Start-Sleep -Seconds 1
+}
+
+# Attempt to delete old install folder
+if (Test-Path $installDir) {
+    try {
+        Write-Host "🧼 Removing old install directory: $installDir"
+        Remove-Item -Recurse -Force $installDir
+    } catch {
+        Write-Warning "⚠️ Could not fully delete $installDir, retrying in 5 seconds..."
+        Start-Sleep -Seconds 5
+        Remove-Item -Recurse -Force $installDir -ErrorAction SilentlyContinue
+    }
+}
 Expand-Archive -Path $zipPath -DestinationPath $installDir
 
 # Install as Windows Service (Staging version)
