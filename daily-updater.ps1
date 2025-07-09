@@ -46,7 +46,7 @@ try {
     # Restart service
     Start-Service -Name $serviceName
 
-    "[$(Get-Date)] ✅ Corina Service (Staging) updated and restarted." | Out-File -Append $logPath
+    "[$(Get-Date)] ✅ Corina Service (Staging) updated, restarted." | Out-File -Append $logPath
 }
 catch {
     "[$(Get-Date)] ❌ Update failed: $_" | Out-File -Append $logPath
