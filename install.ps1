@@ -80,6 +80,12 @@ if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
 # Register the staging service
 sc.exe create $serviceName binPath= "`"$exePath`"" start= auto DisplayName= "Corina Service (Staging)"
 
+# Set recovery options to auto-restart service on crash
+Write-Host "🔁 Configuring service recovery options for Staging..."
+sc.exe failure $serviceName reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
+sc.exe failureflag $serviceName 1 | Out-Null
+Write-Host "✅ Service will auto-restart on failure (3x retries, 5s wait, reset every 1 day)"
+
 # Start the service
 Start-Service -Name $serviceName
 
