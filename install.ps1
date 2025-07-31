@@ -117,15 +117,13 @@ Write-Host "🔧 Setting up scheduled task: $taskName"
 # Define action
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-File `"$shimPath`""
 
-# Define 6 separate time triggers
-$triggers = @(
-    (New-ScheduledTaskTrigger -Daily -At ([datetime]::Parse("07:00 AM"))),
-    (New-ScheduledTaskTrigger -Daily -At ([datetime]::Parse("09:00 AM"))),
-    (New-ScheduledTaskTrigger -Daily -At ([datetime]::Parse("11:00 AM"))),
-    (New-ScheduledTaskTrigger -Daily -At ([datetime]::Parse("01:00 PM"))),
-    (New-ScheduledTaskTrigger -Daily -At ([datetime]::Parse("03:00 PM"))),
-    (New-ScheduledTaskTrigger -Daily -At ([datetime]::Parse("05:00 PM")))
-)
+# Define 6 manual daily triggers
+$trigger1 = New-ScheduledTaskTrigger -Daily -At 7am
+$trigger2 = New-ScheduledTaskTrigger -Daily -At 9am
+$trigger3 = New-ScheduledTaskTrigger -Daily -At 11am
+$trigger4 = New-ScheduledTaskTrigger -Daily -At 1pm
+$trigger5 = New-ScheduledTaskTrigger -Daily -At 3pm
+$trigger6 = New-ScheduledTaskTrigger -Daily -At 5pm
 
 # Run as SYSTEM
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
@@ -138,6 +136,6 @@ if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
 }
 
 # Register with all 6 triggers
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $triggers -Principal $principal
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger1, $trigger2, $trigger3, $trigger4, $trigger5, $trigger6 -Principal $principal
 
 Write-Host "📅 Scheduled task '$taskName' created with 6 triggers: 7AM, 9AM, 11AM, 1PM, 3PM, 5PM"
