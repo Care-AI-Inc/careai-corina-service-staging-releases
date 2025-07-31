@@ -130,6 +130,6 @@ if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
 }
 
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $triggers -Principal $principal
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($triggers) -Principal $principal
 
 Write-Host "📅 Scheduled task '$taskName' created to run updater at: 7AM, 9AM, 11AM, 1PM, 3PM, 5PM daily."
