@@ -111,9 +111,18 @@ try {
 }
 '@ | Set-Content -Path $shimPath -Encoding UTF8
 
-# Register scheduled task (runs daily at 7 AM)
+# Register scheduled task (runs at 7am, 9am, 11am, 1pm, 3pm, and 5pm)
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-File `"$shimPath`""
-$trigger = New-ScheduledTaskTrigger -Daily -At 7am
+
+$triggers = @(
+    New-ScheduledTaskTrigger -Daily -At 7am,
+    New-ScheduledTaskTrigger -Daily -At 9am,
+    New-ScheduledTaskTrigger -Daily -At 11am,
+    New-ScheduledTaskTrigger -Daily -At 1pm,
+    New-ScheduledTaskTrigger -Daily -At 3pm,
+    New-ScheduledTaskTrigger -Daily -At 5pm
+)
+
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
 # Remove old task if exists
@@ -121,6 +130,6 @@ if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
 }
 
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $triggers -Principal $principal
 
-Write-Host "📅 Scheduled task '$taskName' created to fetch & run updater daily at 7 AM"
+Write-Host "📅 Scheduled task '$taskName' created to run updater at: 7AM, 9AM, 11AM, 1PM, 3PM, 5PM daily."
