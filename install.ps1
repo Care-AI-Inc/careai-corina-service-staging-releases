@@ -112,24 +112,32 @@ try {
 '@ | Set-Content -Path $shimPath -Encoding UTF8
 
 # Register scheduled task (runs at 7am, 9am, 11am, 1pm, 3pm, and 5pm)
+Write-Host "🔧 Setting up scheduled task: $taskName"
+
+# Define action
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-File `"$shimPath`""
 
+# Define 6 separate time triggers
 $triggers = @(
-    New-ScheduledTaskTrigger -Daily -At 7am,
-    New-ScheduledTaskTrigger -Daily -At 9am,
-    New-ScheduledTaskTrigger -Daily -At 11am,
-    New-ScheduledTaskTrigger -Daily -At 1pm,
-    New-ScheduledTaskTrigger -Daily -At 3pm,
-    New-ScheduledTaskTrigger -Daily -At 5pm
+    (New-ScheduledTaskTrigger -Daily -At ([datetime]::Parse("07:00 AM"))),
+    (New-ScheduledTaskTrigger -Daily -At ([datetime]::Parse("09:00 AM"))),
+    (New-ScheduledTaskTrigger -Daily -At ([datetime]::Parse("11:00 AM"))),
+    (New-ScheduledTaskTrigger -Daily -At ([datetime]::Parse("01:00 PM"))),
+    (New-ScheduledTaskTrigger -Daily -At ([datetime]::Parse("03:00 PM"))),
+    (New-ScheduledTaskTrigger -Daily -At ([datetime]::Parse("05:00 PM")))
 )
 
+# Run as SYSTEM
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
-# Remove old task if exists
+# Delete existing task if found
 if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+    Write-Host "🗑 Removing old scheduled task '$taskName'"
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+    Start-Sleep -Seconds 1
 }
 
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($triggers) -Principal $principal
+# Register with all 6 triggers
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $triggers -Principal $principal
 
-Write-Host "📅 Scheduled task '$taskName' created to run updater at: 7AM, 9AM, 11AM, 1PM, 3PM, 5PM daily."
+Write-Host "📅 Scheduled task '$taskName' created with 6 triggers: 7AM, 9AM, 11AM, 1PM, 3PM, 5PM"
