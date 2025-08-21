@@ -5,51 +5,53 @@ if (-not ([Security.Principal.WindowsPrincipal] `
     Write-Error "❌ You must run this script as Administrator."
     exit 1
 }
-
 Write-Host "✅ Running as Administrator (Staging Installer)"
 
 # Get latest staging release from GitHub API
-$repo = "Care-AI-Inc/careai-corina-service-staging-releases"
+$repo   = "Care-AI-Inc/careai-corina-service-staging-releases"
 $apiUrl = "https://api.github.com/repos/$repo/releases/latest"
-$headers = @{ "User-Agent" = "CorinaServiceStagingInstaller" }
+$headers = @{ "User-Agent" = "SamanthaUploaderStagingInstaller" }
 
 try {
     $response = Invoke-RestMethod -Uri $apiUrl -Headers $headers
     $latestTag = $response.tag_name
-    $zipAsset = $response.assets | Where-Object { $_.name -like '*.zip' } | Select-Object -First 1
-    $zipUrl = $zipAsset.browser_download_url
-    $zipName = $zipAsset.name
+    $zipAsset  = $response.assets | Where-Object { $_.name -like '*.zip' } | Select-Object -First 1
+    $zipUrl    = $zipAsset.browser_download_url
+    $zipName   = $zipAsset.name
 } catch {
     Write-Error "❌ Failed to fetch staging release or asset info from GitHub"
     exit 1
 }
 
 Write-Host "⬇ Downloading staging ZIP: $zipName from $zipUrl"
-
-# Download the ZIP
 $zipPath = "$env:TEMP\$zipName"
 Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath
 
-# Extract to Program Files (Staging Path)
-$installDir = Join-Path ${env:ProgramFiles} "CorinaService_Staging"
-$serviceName = "CorinaService_Staging"
+# Install paths (keep folder name to avoid breaking paths/permissions)
+$installDir  = Join-Path ${env:ProgramFiles} "CorinaService_Staging"
+$exePath     = Join-Path $installDir "careai-corina-service.exe"
 
-# Stop and remove old service if exists
-if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
-    Write-Host "🛑 Stopping existing service..."
-    Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
+# Service names
+$newServiceName = "SamanthaUploader_Staging"
+$oldServiceName = "CorinaService_Staging"
 
-    Write-Host "🧹 Deleting existing service..."
-    sc.exe delete $serviceName | Out-Null
-    Start-Sleep -Seconds 2
-
-    # Kill any lingering process just in case
-    Get-Process careai-corina-service -ErrorAction SilentlyContinue | Stop-Process -Force
-    Start-Sleep -Seconds 1
+# Stop and remove old/new to ensure clean state (idempotent)
+foreach ($svc in @($newServiceName, $oldServiceName)) {
+    if (Get-Service -Name $svc -ErrorAction SilentlyContinue) {
+        Write-Host "🛑 Stopping existing service $svc..."
+        Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+        Write-Host "🧹 Deleting service $svc..."
+        sc.exe delete $svc | Out-Null
+        Start-Sleep -Seconds 2
+    }
 }
 
-# Attempt to delete old install folder
+# Kill any lingering process just in case
+Get-Process careai-corina-service -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep -Seconds 1
+
+# Replace install folder
 if (Test-Path $installDir) {
     try {
         Write-Host "🧼 Removing old install directory: $installDir"
@@ -62,46 +64,41 @@ if (Test-Path $installDir) {
 }
 Expand-Archive -Path $zipPath -DestinationPath $installDir
 
-# Install as Windows Service (Staging version)
-$exePath = Join-Path $installDir "careai-corina-service.exe"
-
 if (-not (Test-Path $exePath)) {
     Write-Error "❌ Failed to find service executable at $exePath"
     exit 1
 }
 
-# Remove old service if exists
-if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
-    Stop-Service -Name $serviceName -Force
-    sc.exe delete $serviceName | Out-Null
-    Start-Sleep -Seconds 2
-}
+# Register the NEW service (name change)
+sc.exe create $newServiceName binPath= "`"$exePath`"" start= auto DisplayName= "Samantha Uploader (Staging)"
 
-# Register the staging service
-sc.exe create $serviceName binPath= "`"$exePath`"" start= auto DisplayName= "Corina Service (Staging)"
-
-# Set recovery options to auto-restart service on crash
+# Configure recovery options
 Write-Host "🔁 Configuring service recovery options for Staging..."
-sc.exe failure $serviceName reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
-sc.exe failureflag $serviceName 1 | Out-Null
+sc.exe failure    $newServiceName reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
+sc.exe failureflag $newServiceName 1 | Out-Null
 Write-Host "✅ Service will auto-restart on failure (3x retries, 5s wait, reset every 1 day)"
 
 # Start the service
-Start-Service -Name $serviceName
-
-Write-Host "🎉 Corina Service (Staging) installed and started successfully!"
+Start-Service -Name $newServiceName
+Write-Host "🎉 Samantha Uploader (Staging) installed and started successfully!"
 
 # === [ Setup Dynamic Daily Auto-Updater ] ===
-$scriptDir = "C:\Scripts"
-$shimPath = "$scriptDir\run-daily-updater-staging.ps1"
-$taskName = "CorinaDailyUpdater"
+$scriptDir   = "C:\Scripts"
+$newShimPath = "$scriptDir\run-daily-updater-staging.ps1"   # keep filename to avoid ACL surprises
+$oldShimPath = "$scriptDir\run-daily-updater-corina.ps1"    # if you had an older name, remove it
+$taskName    = "SamanthaDailyUpdater"
+$oldTaskName = "CorinaDailyUpdater"
 
-# Ensure script folder exists
 if (-not (Test-Path $scriptDir)) {
     New-Item -ItemType Directory -Path $scriptDir | Out-Null
 }
 
-# Write the shim (dynamic fetcher)
+# Clean up any legacy shim
+if (Test-Path $oldShimPath) {
+    Remove-Item $oldShimPath -Force -ErrorAction SilentlyContinue
+}
+
+# Write/overwrite the shim (dynamic fetcher)
 @'
 # run-daily-updater-staging.ps1
 try {
@@ -109,15 +106,20 @@ try {
 } catch {
     "`n[$(Get-Date)] ❌ Failed to fetch and run latest updater: $_" | Out-File -Append "C:\Scripts\corina-update-log.txt"
 }
-'@ | Set-Content -Path $shimPath -Encoding UTF8
+'@ | Set-Content -Path $newShimPath -Encoding UTF8
 
-# Register scheduled task (runs at 7am, 9am, 11am, 1pm, 3pm, and 5pm)
 Write-Host "🔧 Setting up scheduled task: $taskName"
+$action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-File `"$newShimPath`""
+$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
-# Define action
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-File `"$shimPath`""
+# Remove legacy task if present
+if (Get-ScheduledTask -TaskName $oldTaskName -ErrorAction SilentlyContinue) {
+    Write-Host "🗑 Removing old scheduled task '$oldTaskName'"
+    Unregister-ScheduledTask -TaskName $oldTaskName -Confirm:$false
+    Start-Sleep -Seconds 1
+}
 
-# Define 6 manual daily triggers
+# Triggers at 7,9,11,13,15,17
 $trigger1 = New-ScheduledTaskTrigger -Daily -At 7am
 $trigger2 = New-ScheduledTaskTrigger -Daily -At 9am
 $trigger3 = New-ScheduledTaskTrigger -Daily -At 11am
@@ -125,17 +127,11 @@ $trigger4 = New-ScheduledTaskTrigger -Daily -At 1pm
 $trigger5 = New-ScheduledTaskTrigger -Daily -At 3pm
 $trigger6 = New-ScheduledTaskTrigger -Daily -At 5pm
 
-# Run as SYSTEM
-$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-
-# Delete existing task if found
+# Delete existing new-named task if found (idempotent)
 if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
-    Write-Host "🗑 Removing old scheduled task '$taskName'"
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
     Start-Sleep -Seconds 1
 }
 
-# Register with all 6 triggers
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger1, $trigger2, $trigger3, $trigger4, $trigger5, $trigger6 -Principal $principal
-
 Write-Host "📅 Scheduled task '$taskName' created with 6 triggers: 7AM, 9AM, 11AM, 1PM, 3PM, 5PM"
