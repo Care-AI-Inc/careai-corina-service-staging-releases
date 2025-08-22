@@ -1,5 +1,6 @@
 # daily-updater-staging.ps1
 # Purpose: Keep Samantha Uploader (Staging) up to date and finish migration from Corina if any remnants exist.
+# Includes robust cleanup to handle locked files (e.g., logs).
 
 # =========================
 # Admin Check
@@ -42,6 +43,76 @@ $exePath        = Join-Path $installDir $exeName
 
 $tempZip    = $null
 $extractDir = Join-Path $env:TEMP "SamanthaStagingExtract"
+
+# =========================
+# Robust directory removal helper
+# =========================
+function Remove-DirRobust {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [int]$Retries = 3,
+        [int]$DelaySeconds = 2
+    )
+
+    # 0) Best-effort: ensure nothing is holding the folder
+    Get-Process careai-corina-service -ErrorAction SilentlyContinue | Stop-Process -Force
+    Start-Sleep -Seconds 1
+
+    # 1) Try a straight delete a few times
+    for ($i=1; $i -le $Retries; $i++) {
+        try {
+            if (Test-Path $Path) {
+                # Clear read-only attributes just in case
+                Get-ChildItem -LiteralPath $Path -Force -Recurse -ErrorAction SilentlyContinue |
+                    ForEach-Object { try { $_.Attributes = 'Normal' } catch {} }
+
+                Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            }
+            return $true
+        } catch {
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    }
+
+    # 2) Use robocopy MIR trick to clear most contents (leaves only locked files)
+    if (Test-Path $Path) {
+        $empty = Join-Path $env:TEMP ("empty_" + [guid]::NewGuid())
+        New-Item -ItemType Directory -Path $empty | Out-Null
+        $rc = robocopy $empty $Path /MIR /R:1 /W:1 /NFL /NDL /NP /NJH /NJS
+        Remove-Item -LiteralPath $empty -Recurse -Force -ErrorAction SilentlyContinue
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            return $true
+        } catch { }
+    }
+
+    # 3) Quarantine (rename) the folder, then schedule a one-shot delete at next boot
+    if (Test-Path $Path) {
+        $stamp = Get-Date -Format "yyyyMMddHHmmss"
+        $quarantine = "$Path._stale_$stamp"
+        try {
+            Rename-Item -LiteralPath $Path -NewName (Split-Path $quarantine -Leaf) -ErrorAction Stop
+        } catch {
+            return $false  # rename failed; next run will retry
+        }
+
+        # Create a self-deleting startup task to remove the quarantined folder on next boot
+        $taskName  = "SamanthaCleanupOldCorina_$stamp"
+        $cmd       = "cmd.exe"
+        $args      = "/c rmdir /s /q `"$quarantine`" && schtasks /Delete /TN `"$taskName`" /F"
+
+        $action    = New-ScheduledTaskAction -Execute $cmd -Argument $args
+        $trigger   = New-ScheduledTaskTrigger -AtStartup
+        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+        try {
+            Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal | Out-Null
+        } catch { }
+
+        return $false  # not gone now, but will be removed at next boot
+    }
+
+    return $true
+}
 
 try {
     # =========================
@@ -131,13 +202,14 @@ try {
     }
 
     # =========================
-    # Clean up old install folder (only after new service is running)
+    # Clean up old install folder (robust)
     # =========================
     if (Test-Path $oldInstallDir) {
-        try {
-            Remove-Item -Recurse -Force $oldInstallDir
-        } catch {
-            "[$(Get-Date)] ⚠️ Could not fully delete $oldInstallDir; will retry next run." | Out-File -Append $logPath
+        $ok = Remove-DirRobust -Path $oldInstallDir
+        if (-not $ok) {
+            "[$(Get-Date)] ⚠️ Old Corina folder was quarantined; a startup task will delete it on next boot." | Out-File -Append $logPath
+        } else {
+            "[$(Get-Date)] ✅ Old Corina folder removed." | Out-File -Append $logPath
         }
     }
 
