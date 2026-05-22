@@ -13,6 +13,65 @@ if (-not ([Security.Principal.WindowsPrincipal] `
 Write-Host "✅ Running as Administrator (Samantha Uploader - Staging Installer)"
 
 # =========================
+# Multi-instance bootstrap
+# =========================
+function Get-CorinaRegistryInstance {
+    $instance = [Environment]::GetEnvironmentVariable("CorinaRegistryInstance", [System.EnvironmentVariableTarget]::Process)
+
+    if ([string]::IsNullOrWhiteSpace($instance)) {
+        $callerValue = Get-Variable -Name registryInstance -ValueOnly -ErrorAction SilentlyContinue
+        if (-not [string]::IsNullOrWhiteSpace([string]$callerValue)) {
+            $instance = [string]$callerValue
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($instance)) {
+        return $null
+    }
+
+    $instance = $instance.Trim()
+    if ($instance -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$') {
+        throw "Invalid CorinaRegistryInstance '$instance'. Use letters, numbers, hyphen, or underscore."
+    }
+
+    $env:CorinaRegistryInstance = $instance
+    return $instance
+}
+
+function Stop-ServiceProcessByName {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    try {
+        $svc = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
+        if ($svc -and $svc.ProcessId -and $svc.ProcessId -ne 0) {
+            Stop-Process -Id $svc.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    } catch { }
+}
+
+function Set-CorinaServiceEnvironment {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [string]$Instance
+    )
+
+    $svcRegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$Name"
+    $values = @("DOTNET_ENVIRONMENT=Staging")
+    if (-not [string]::IsNullOrWhiteSpace($Instance)) {
+        $values += "CorinaRegistryInstance=$Instance"
+    }
+
+    New-ItemProperty -Path $svcRegPath -Name Environment -PropertyType MultiString -Value $values -Force | Out-Null
+}
+
+$corinaRegistryInstance = Get-CorinaRegistryInstance
+if ($corinaRegistryInstance) {
+    Write-Host "Using Corina registry instance: $corinaRegistryInstance"
+} else {
+    Write-Host "No CorinaRegistryInstance provided; using single-instance staging install."
+}
+
+# =========================
 # Release Source (unchanged repo/artifacts)
 # =========================
 $repo   = "Care-AI-Inc/careai-corina-service-staging-releases"
@@ -32,21 +91,31 @@ try {
 
 Write-Host "⬇ Downloading staging ZIP: $zipName"
 $zipPath    = Join-Path $env:TEMP $zipName
-$extractDir = Join-Path $env:TEMP "SamanthaStagingExtract"
+$instanceSuffix = if ($corinaRegistryInstance) { "-$corinaRegistryInstance" } else { "" }
+$extractDir = Join-Path $env:TEMP "SamanthaStagingExtract$instanceSuffix"
 Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath
 
 # =========================
 # Names and Paths
 # =========================
-$newServiceName = "SamanthaUploader_Staging"
-$oldServiceName = "CorinaService_Staging"
-
-$newTaskName    = "SamanthaDailyUpdater"
-$oldTaskName    = "CorinaDailyUpdater"
-
 $exeName        = "careai-corina-service.exe"  # keep current exe name; change later when your releases do
-$newInstallDir  = Join-Path ${env:ProgramFiles} "SamanthaUploader_Staging"
-$oldInstallDir  = Join-Path ${env:ProgramFiles} "CorinaService_Staging"
+if ($corinaRegistryInstance) {
+    $newServiceName = "SamanthaUploader_Staging-$corinaRegistryInstance"
+    $oldServiceName = "CorinaService_Staging-$corinaRegistryInstance"
+    $newTaskName    = "SamanthaDailyUpdater-$corinaRegistryInstance"
+    $oldTaskName    = "CorinaDailyUpdater-$corinaRegistryInstance"
+    $newInstallDir  = Join-Path (Join-Path ${env:ProgramFiles} "SamanthaUploader_Staging") $corinaRegistryInstance
+    $oldInstallDir  = Join-Path (Join-Path ${env:ProgramFiles} "CorinaService_Staging") $corinaRegistryInstance
+    $serviceDisplayName = "Samantha Uploader (Staging - $corinaRegistryInstance)"
+} else {
+    $newServiceName = "SamanthaUploader_Staging"
+    $oldServiceName = "CorinaService_Staging"
+    $newTaskName    = "SamanthaDailyUpdater"
+    $oldTaskName    = "CorinaDailyUpdater"
+    $newInstallDir  = Join-Path ${env:ProgramFiles} "SamanthaUploader_Staging"
+    $oldInstallDir  = Join-Path ${env:ProgramFiles} "CorinaService_Staging"
+    $serviceDisplayName = "Samantha Uploader (Staging)"
+}
 $exePath        = Join-Path $newInstallDir $exeName
 
 # =========================
@@ -58,14 +127,11 @@ foreach ($svc in @($newServiceName, $oldServiceName)) {
         Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2
         Write-Host "🧹 Deleting service $svc..."
+        Stop-ServiceProcessByName -Name $svc
         sc.exe delete $svc | Out-Null
         Start-Sleep -Seconds 2
     }
 }
-# Best-effort kill of lingering process
-Get-Process careai-corina-service -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-Sleep -Seconds 1
-
 # =========================
 # Prepare directories and migration copy (old → new) once
 # =========================
@@ -94,7 +160,8 @@ if (-not (Test-Path $exePath)) {
 # Register new service and configure recovery
 # =========================
 Write-Host "🆕 Creating Windows service: $newServiceName"
-sc.exe create $newServiceName binPath= "`"$exePath`"" start= auto DisplayName= "Samantha Uploader (Staging)" | Out-Null
+sc.exe create $newServiceName binPath= "`"$exePath`"" start= auto DisplayName= "$serviceDisplayName" | Out-Null
+Set-CorinaServiceEnvironment -Name $newServiceName -Instance $corinaRegistryInstance
 sc.exe failure     $newServiceName reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
 sc.exe failureflag $newServiceName 1 | Out-Null
 
@@ -112,8 +179,11 @@ Write-Host "✅ Service '$newServiceName' is running."
 # Scheduled Task: remove old, create new
 # =========================
 $scriptDir = "C:\Scripts"
-$newShimPath = Join-Path $scriptDir "run-daily-updater-staging.ps1"
-$logPath = Join-Path $scriptDir "samantha-update-log.txt"
+if ($corinaRegistryInstance) {
+    $newShimPath = Join-Path $scriptDir "run-daily-updater-staging-$corinaRegistryInstance.ps1"
+} else {
+    $newShimPath = Join-Path $scriptDir "run-daily-updater-staging.ps1"
+}
 
 if (-not (Test-Path $scriptDir)) { New-Item -ItemType Directory -Path $scriptDir | Out-Null }
 
@@ -126,10 +196,12 @@ if (Test-Path $oldShimPath) {
 # Write/overwrite shim (pulls latest updater every run)
 @'
 # run-daily-updater-staging.ps1
+$_inst    = $env:CorinaRegistryInstance
+$_logPath = if ($_inst) { "C:\Scripts\samantha-update-log-$_inst.txt" } else { "C:\Scripts\samantha-update-log.txt" }
 try {
     Invoke-Expression (Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-staging-releases/main/daily-updater.ps1" -UseBasicParsing).Content
 } catch {
-    "`n[$(Get-Date)] ❌ Failed to fetch and run latest updater: $_" | Out-File -Append "C:\Scripts\samantha-update-log.txt"
+    "`n[$(Get-Date)] ❌ Failed to fetch and run latest updater: $_" | Out-File -Append $_logPath
 }
 '@ | Set-Content -Path $newShimPath -Encoding UTF8
 
@@ -141,7 +213,12 @@ if (Get-ScheduledTask -TaskName $oldTaskName -ErrorAction SilentlyContinue) {
 }
 
 # Define action/principal/triggers
-$action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-File `"$newShimPath`""
+if ($corinaRegistryInstance) {
+    $taskArgument = "-NoProfile -ExecutionPolicy Bypass -Command `"`$env:CorinaRegistryInstance='$corinaRegistryInstance'; `$env:DOTNET_ENVIRONMENT='Staging'; & '$newShimPath'`""
+} else {
+    $taskArgument = "-NoProfile -ExecutionPolicy Bypass -File `"$newShimPath`""
+}
+$action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $taskArgument
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 $trigger1  = New-ScheduledTaskTrigger -Daily -At 7am
 $trigger2  = New-ScheduledTaskTrigger -Daily -At 9am

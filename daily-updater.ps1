@@ -13,11 +13,69 @@ if (-not ([Security.Principal.WindowsPrincipal] `
 }
 
 # =========================
+# Multi-instance bootstrap
+# =========================
+function Get-CorinaRegistryInstance {
+    $instance = [Environment]::GetEnvironmentVariable("CorinaRegistryInstance", [System.EnvironmentVariableTarget]::Process)
+
+    if ([string]::IsNullOrWhiteSpace($instance)) {
+        $callerValue = Get-Variable -Name registryInstance -ValueOnly -ErrorAction SilentlyContinue
+        if (-not [string]::IsNullOrWhiteSpace([string]$callerValue)) {
+            $instance = [string]$callerValue
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($instance)) {
+        return $null
+    }
+
+    $instance = $instance.Trim()
+    if ($instance -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$') {
+        throw "Invalid CorinaRegistryInstance '$instance'. Use letters, numbers, hyphen, or underscore."
+    }
+
+    $env:CorinaRegistryInstance = $instance
+    return $instance
+}
+
+function Stop-ServiceProcessByName {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    try {
+        $svc = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
+        if ($svc -and $svc.ProcessId -and $svc.ProcessId -ne 0) {
+            Stop-Process -Id $svc.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    } catch { }
+}
+
+function Set-CorinaServiceEnvironment {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [string]$Instance
+    )
+
+    $svcRegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$Name"
+    $values = @("DOTNET_ENVIRONMENT=Staging")
+    if (-not [string]::IsNullOrWhiteSpace($Instance)) {
+        $values += "CorinaRegistryInstance=$Instance"
+    }
+
+    New-ItemProperty -Path $svcRegPath -Name Environment -PropertyType MultiString -Value $values -Force | Out-Null
+}
+
+$corinaRegistryInstance = Get-CorinaRegistryInstance
+
+# =========================
 # Logging
 # =========================
 $logDir  = "C:\Scripts"
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
-$logPath = Join-Path $logDir "samantha-update-log.txt"
+if ($corinaRegistryInstance) {
+    $logPath = Join-Path $logDir "samantha-update-log-$corinaRegistryInstance.txt"
+} else {
+    $logPath = Join-Path $logDir "samantha-update-log.txt"
+}
 "[$(Get-Date)] 🔄 Starting Samantha Uploader (Staging) update..." | Out-File -Append $logPath
 
 # =========================
@@ -30,19 +88,29 @@ $headers = @{ "User-Agent" = "SamanthaUploaderStagingUpdater" }
 # =========================
 # Names and Paths
 # =========================
-$newServiceName = "SamanthaUploader_Staging"
-$oldServiceName = "CorinaService_Staging"
-
-$newTaskName    = "SamanthaDailyUpdater"
-$oldTaskName    = "CorinaDailyUpdater"
-
 $exeName        = "careai-corina-service.exe"  # keep current exe name; change later when your releases do
-$installDir     = Join-Path ${env:ProgramFiles} "SamanthaUploader_Staging"
-$oldInstallDir  = Join-Path ${env:ProgramFiles} "CorinaService_Staging"
+if ($corinaRegistryInstance) {
+    $newServiceName = "SamanthaUploader_Staging-$corinaRegistryInstance"
+    $oldServiceName = "CorinaService_Staging-$corinaRegistryInstance"
+    $newTaskName    = "SamanthaDailyUpdater-$corinaRegistryInstance"
+    $oldTaskName    = "CorinaDailyUpdater-$corinaRegistryInstance"
+    $installDir     = Join-Path (Join-Path ${env:ProgramFiles} "SamanthaUploader_Staging") $corinaRegistryInstance
+    $oldInstallDir  = Join-Path (Join-Path ${env:ProgramFiles} "CorinaService_Staging") $corinaRegistryInstance
+    $serviceDisplayName = "Samantha Uploader (Staging - $corinaRegistryInstance)"
+} else {
+    $newServiceName = "SamanthaUploader_Staging"
+    $oldServiceName = "CorinaService_Staging"
+    $newTaskName    = "SamanthaDailyUpdater"
+    $oldTaskName    = "CorinaDailyUpdater"
+    $installDir     = Join-Path ${env:ProgramFiles} "SamanthaUploader_Staging"
+    $oldInstallDir  = Join-Path ${env:ProgramFiles} "CorinaService_Staging"
+    $serviceDisplayName = "Samantha Uploader (Staging)"
+}
 $exePath        = Join-Path $installDir $exeName
 
 $tempZip    = $null
-$extractDir = Join-Path $env:TEMP "SamanthaStagingExtract"
+$instanceSuffix = if ($corinaRegistryInstance) { "-$corinaRegistryInstance" } else { "" }
+$extractDir = Join-Path $env:TEMP "SamanthaStagingExtract$instanceSuffix"
 
 # =========================
 # Robust directory removal helper
@@ -54,8 +122,9 @@ function Remove-DirRobust {
         [int]$DelaySeconds = 2
     )
 
-    # 0) Best-effort: ensure nothing is holding the folder
-    Get-Process careai-corina-service -ErrorAction SilentlyContinue | Stop-Process -Force
+    # 0) Best-effort: ensure this instance is not holding the folder
+    Stop-ServiceProcessByName -Name $newServiceName
+    Stop-ServiceProcessByName -Name $oldServiceName
     Start-Sleep -Seconds 1
 
     # 1) Try a straight delete a few times
@@ -142,8 +211,8 @@ try {
     if ($svcToStop) {
         Stop-Service -Name $svcToStop.Name -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2
-        # Best-effort kill of lingering process
-        Get-Process careai-corina-service -ErrorAction SilentlyContinue | Stop-Process -Force
+        # Best-effort kill of this lingering service process
+        Stop-ServiceProcessByName -Name $svcToStop.Name
         Start-Sleep -Seconds 1
     }
 
@@ -178,26 +247,29 @@ try {
     if (-not $hasNew) {
         if ($hasOld) {
             # Create new service, start it, then remove old
-            sc.exe create $newServiceName binPath= "`"$exePath`"" start= auto DisplayName= "Samantha Uploader (Staging)" | Out-Null
+            sc.exe create $newServiceName binPath= "`"$exePath`"" start= auto DisplayName= "$serviceDisplayName" | Out-Null
+            Set-CorinaServiceEnvironment -Name $newServiceName -Instance $corinaRegistryInstance
             sc.exe failure     $newServiceName reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
             sc.exe failureflag $newServiceName 1 | Out-Null
 
             Start-Service -Name $newServiceName
             Start-Sleep -Seconds 3
             $svc = Get-Service -Name $newServiceName -ErrorAction Stop
-            if ($svc.Status -ne 'Running') { throw "New service failed to start (status: $($svc.Status))" }
+            if ($svc.Status -ne 'Running') { throw "❌ New service failed to start (status: $($svc.Status))" }
 
             sc.exe delete $oldServiceName | Out-Null
             Start-Sleep -Seconds 1
         } else {
-            # Neither exists → create new cleanly
-            sc.exe create $newServiceName binPath= "`"$exePath`"" start= auto DisplayName= "Samantha Uploader (Staging)" | Out-Null
+            # Neither exists  create new cleanly
+            sc.exe create $newServiceName binPath= "`"$exePath`"" start= auto DisplayName= "$serviceDisplayName" | Out-Null
+            Set-CorinaServiceEnvironment -Name $newServiceName -Instance $corinaRegistryInstance
             sc.exe failure     $newServiceName reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
             sc.exe failureflag $newServiceName 1 | Out-Null
             Start-Service -Name $newServiceName
         }
     } else {
-        # New exists → start it
+        # New exists  start it
+        Set-CorinaServiceEnvironment -Name $newServiceName -Instance $corinaRegistryInstance
         Start-Service -Name $newServiceName
     }
 
@@ -223,31 +295,42 @@ catch {
 # Scheduled Task: migrate old → new, or ensure new with desired times
 # =========================
 $scriptDir = "C:\Scripts"
-$shimPath  = Join-Path $scriptDir "run-daily-updater-staging.ps1"
+if ($corinaRegistryInstance) {
+    $shimPath  = Join-Path $scriptDir "run-daily-updater-staging-$corinaRegistryInstance.ps1"
+} else {
+    $shimPath  = Join-Path $scriptDir "run-daily-updater-staging.ps1"
+}
 
 # Ensure shim exists (pulls latest updater on each run)
 if (-not (Test-Path $scriptDir)) { New-Item -ItemType Directory -Path $scriptDir | Out-Null }
 if (-not (Test-Path $shimPath)) {
 @'
 # run-daily-updater-staging.ps1
+$_inst    = $env:CorinaRegistryInstance
+$_logPath = if ($_inst) { "C:\Scripts\samantha-update-log-$_inst.txt" } else { "C:\Scripts\samantha-update-log.txt" }
 try {
     Invoke-Expression (Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-staging-releases/main/daily-updater.ps1" -UseBasicParsing).Content
 } catch {
-    "`n[$(Get-Date)] ❌ Failed to fetch and run latest updater: $_" | Out-File -Append "C:\Scripts\samantha-update-log.txt"
+    "`n[$(Get-Date)] ❌ Failed to fetch and run latest updater: $_" | Out-File -Append $_logPath
 }
 '@ | Set-Content -Path $shimPath -Encoding UTF8
 }
 
 try {
+    if ($corinaRegistryInstance) {
+        $taskArgument = "-NoProfile -ExecutionPolicy Bypass -Command `"`$env:CorinaRegistryInstance='$corinaRegistryInstance'; `$env:DOTNET_ENVIRONMENT='Staging'; & '$shimPath'`""
+    } else {
+        $taskArgument = "-NoProfile -ExecutionPolicy Bypass -File `"$shimPath`""
+    }
+    $taskAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $taskArgument
+
     if (Get-ScheduledTask -TaskName $oldTaskName -ErrorAction SilentlyContinue) {
         $oldTask = Get-ScheduledTask -TaskName $oldTaskName
-        $action  = $oldTask.Actions[0]
         $trigs   = $oldTask.Triggers
         Unregister-ScheduledTask -TaskName $oldTaskName -Confirm:$false
         $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-        Register-ScheduledTask -TaskName $newTaskName -Action $action -Trigger $trigs -Principal $principal | Out-Null
+        Register-ScheduledTask -TaskName $newTaskName -Action $taskAction -Trigger $trigs -Principal $principal | Out-Null
     } elseif (-not (Get-ScheduledTask -TaskName $newTaskName -ErrorAction SilentlyContinue)) {
-        $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-File `"$shimPath`""
         $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
         $trigs = @(
             New-ScheduledTaskTrigger -Daily -At 7am,
@@ -257,7 +340,9 @@ try {
             New-ScheduledTaskTrigger -Daily -At 3pm,
             New-ScheduledTaskTrigger -Daily -At 5pm
         )
-        Register-ScheduledTask -TaskName $newTaskName -Action $action -Trigger $trigs -Principal $principal | Out-Null
+        Register-ScheduledTask -TaskName $newTaskName -Action $taskAction -Trigger $trigs -Principal $principal | Out-Null
+    } else {
+        Set-ScheduledTask -TaskName $newTaskName -Action $taskAction -ErrorAction SilentlyContinue | Out-Null
     }
 
     # Ensure desired additional times exist (idempotent)
