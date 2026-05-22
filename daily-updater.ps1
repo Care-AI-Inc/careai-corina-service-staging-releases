@@ -302,19 +302,20 @@ if ($corinaRegistryInstance) {
     $shimPath  = Join-Path $scriptDir "run-daily-updater-staging.ps1"
 }
 
-# Ensure shim exists (pulls latest updater on each run)
+# Ensure shim exists (pulls latest updater on each run, instance hardcoded so manual runs work)
 if (-not (Test-Path $scriptDir)) { New-Item -ItemType Directory -Path $scriptDir | Out-Null }
 if (-not (Test-Path $shimPath)) {
-@'
-# run-daily-updater-staging.ps1
-$_inst    = $env:CorinaRegistryInstance
-$_logPath = if ($_inst) { "C:\Scripts\samantha-update-log-$_inst.txt" } else { "C:\Scripts\samantha-update-log.txt" }
+    $_logFile = if ($corinaRegistryInstance) { "C:\Scripts\samantha-update-log-$corinaRegistryInstance.txt" } else { "C:\Scripts\samantha-update-log.txt" }
+    $_setInst = if ($corinaRegistryInstance) { "`$env:CorinaRegistryInstance = '$corinaRegistryInstance'" } else { "" }
+    @"
+$_setInst
+`$env:DOTNET_ENVIRONMENT = 'Staging'
 try {
     Invoke-Expression (Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-staging-releases/main/daily-updater.ps1" -UseBasicParsing).Content
 } catch {
-    "`n[$(Get-Date)] ❌ Failed to fetch and run latest updater: $_" | Out-File -Append $_logPath
+    "`n[`$(Get-Date)] ❌ Failed to fetch and run latest updater: `$_" | Out-File -Append "$_logFile"
 }
-'@ | Set-Content -Path $shimPath -Encoding UTF8
+"@ | Set-Content -Path $shimPath -Encoding UTF8
 }
 
 try {

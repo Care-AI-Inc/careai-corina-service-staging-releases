@@ -193,17 +193,18 @@ if (Test-Path $oldShimPath) {
     Remove-Item $oldShimPath -Force -ErrorAction SilentlyContinue
 }
 
-# Write/overwrite shim (pulls latest updater every run)
-@'
-# run-daily-updater-staging.ps1
-$_inst    = $env:CorinaRegistryInstance
-$_logPath = if ($_inst) { "C:\Scripts\samantha-update-log-$_inst.txt" } else { "C:\Scripts\samantha-update-log.txt" }
+# Write/overwrite shim (pulls latest updater every run, instance hardcoded so manual runs work)
+$_logFile = if ($corinaRegistryInstance) { "C:\Scripts\samantha-update-log-$corinaRegistryInstance.txt" } else { "C:\Scripts\samantha-update-log.txt" }
+$_setInst = if ($corinaRegistryInstance) { "`$env:CorinaRegistryInstance = '$corinaRegistryInstance'" } else { "" }
+@"
+$_setInst
+`$env:DOTNET_ENVIRONMENT = 'Staging'
 try {
     Invoke-Expression (Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-staging-releases/main/daily-updater.ps1" -UseBasicParsing).Content
 } catch {
-    "`n[$(Get-Date)] ❌ Failed to fetch and run latest updater: $_" | Out-File -Append $_logPath
+    "`n[`$(Get-Date)] ❌ Failed to fetch and run latest updater: `$_" | Out-File -Append "$_logFile"
 }
-'@ | Set-Content -Path $newShimPath -Encoding UTF8
+"@ | Set-Content -Path $newShimPath -Encoding UTF8
 
 # Remove legacy task if present
 if (Get-ScheduledTask -TaskName $oldTaskName -ErrorAction SilentlyContinue) {
