@@ -78,6 +78,16 @@ if ($corinaRegistryInstance) {
 }
 "[$(Get-Date)] 🔄 Starting Samantha Uploader (Staging) update..." | Out-File -Append $logPath
 
+# Concurrency guard — only one updater per instance at a time
+$mutexName = if ($corinaRegistryInstance) { "Global\SamanthaStagingUpdater-$corinaRegistryInstance" } else { "Global\SamanthaStagingUpdater" }
+$mutex = New-Object Threading.Mutex($false, $mutexName)
+if (-not $mutex.WaitOne([TimeSpan]::FromMinutes(30))) {
+    "[$(Get-Date)] ⚠️ Another updater instance is already running. Exiting." | Out-File -Append $logPath
+    exit 0
+}
+
+try {
+
 # =========================
 # Release Source (unchanged repo/artifacts)
 # =========================
@@ -290,6 +300,10 @@ try {
 }
 catch {
     "[$(Get-Date)] ❌ Update failed: $_" | Out-File -Append $logPath
+}
+finally {
+    $mutex.ReleaseMutex()
+    $mutex.Dispose()
 }
 
 # =========================
