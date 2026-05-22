@@ -302,12 +302,11 @@ if ($corinaRegistryInstance) {
     $shimPath  = Join-Path $scriptDir "run-daily-updater-staging.ps1"
 }
 
-# Ensure shim exists (pulls latest updater on each run, instance hardcoded so manual runs work)
+# Always overwrite shim so instance name stays current and manual runs work without env var
 if (-not (Test-Path $scriptDir)) { New-Item -ItemType Directory -Path $scriptDir | Out-Null }
-if (-not (Test-Path $shimPath)) {
-    $_logFile = if ($corinaRegistryInstance) { "C:\Scripts\samantha-update-log-$corinaRegistryInstance.txt" } else { "C:\Scripts\samantha-update-log.txt" }
-    $_setInst = if ($corinaRegistryInstance) { "`$env:CorinaRegistryInstance = '$corinaRegistryInstance'" } else { "" }
-    @"
+$_logFile = if ($corinaRegistryInstance) { "C:\Scripts\samantha-update-log-$corinaRegistryInstance.txt" } else { "C:\Scripts\samantha-update-log.txt" }
+$_setInst = if ($corinaRegistryInstance) { "`$env:CorinaRegistryInstance = '$corinaRegistryInstance'" } else { "" }
+@"
 $_setInst
 `$env:DOTNET_ENVIRONMENT = 'Staging'
 try {
@@ -316,7 +315,6 @@ try {
     "`n[`$(Get-Date)] ❌ Failed to fetch and run latest updater: `$_" | Out-File -Append "$_logFile"
 }
 "@ | Set-Content -Path $shimPath -Encoding UTF8
-}
 
 try {
     if ($corinaRegistryInstance) {
