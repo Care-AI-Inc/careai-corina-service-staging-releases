@@ -193,7 +193,8 @@ try {
 
     $zipUrl  = $zipAsset.browser_download_url
     $zipName = $zipAsset.name
-    $tempZip = Join-Path $env:TEMP $zipName
+    $zipBaseName = [System.IO.Path]::GetFileNameWithoutExtension($zipName)
+    $tempZip = Join-Path $env:TEMP "$zipBaseName$instanceSuffix.zip"
 
     Invoke-WebRequest -Uri $zipUrl -OutFile $tempZip
 
