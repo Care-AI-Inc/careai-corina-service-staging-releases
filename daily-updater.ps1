@@ -1,4 +1,4 @@
-﻿# daily-updater-staging.ps1
+# daily-updater-staging.ps1
 # Purpose: Keep Samantha Uploader (Staging) up to date and finish migration from Corina if any remnants exist.
 # Includes robust cleanup to handle locked files (e.g., logs).
 
@@ -322,7 +322,11 @@ $_setInst = if ($corinaRegistryInstance) { "`$env:CorinaRegistryInstance = '$cor
 $_setInst
 `$env:DOTNET_ENVIRONMENT = 'Staging'
 try {
-    Invoke-Expression (Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-staging-releases/main/daily-updater.ps1" -UseBasicParsing).Content
+    `$content = (Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-staging-releases/main/daily-updater.ps1" -UseBasicParsing).Content
+    if (`$content.Length -gt 0 -and `$content[0] -eq [char]0xFEFF) {
+        `$content = `$content.Substring(1)
+    }
+    Invoke-Expression `$content
 } catch {
     "`n[`$(Get-Date)]  Failed to fetch and run latest updater: `$_" | Out-File -Append "$_logFile"
 }

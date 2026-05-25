@@ -1,4 +1,4 @@
-﻿# install-samantha-uploader-staging.ps1
+# install-samantha-uploader-staging.ps1
 # Purpose: Clean install or migrate from Corina  Samantha Uploader (Staging) with new service/folder/task names.
 
 # =========================
@@ -200,7 +200,11 @@ $_setInst = if ($corinaRegistryInstance) { "`$env:CorinaRegistryInstance = '$cor
 $_setInst
 `$env:DOTNET_ENVIRONMENT = 'Staging'
 try {
-    Invoke-Expression (Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-staging-releases/main/daily-updater.ps1" -UseBasicParsing).Content
+    `$content = (Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-staging-releases/main/daily-updater.ps1" -UseBasicParsing).Content
+    if (`$content.Length -gt 0 -and `$content[0] -eq [char]0xFEFF) {
+        `$content = `$content.Substring(1)
+    }
+    Invoke-Expression `$content
 } catch {
     "`n[`$(Get-Date)]  Failed to fetch and run latest updater: `$_" | Out-File -Append "$_logFile"
 }
