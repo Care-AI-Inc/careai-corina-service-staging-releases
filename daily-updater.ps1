@@ -1,4 +1,4 @@
-# daily-updater-staging.ps1
+﻿# daily-updater-staging.ps1
 # Purpose: Keep Samantha Uploader (Staging) up to date and finish migration from Corina if any remnants exist.
 # Includes robust cleanup to handle locked files (e.g., logs).
 
@@ -8,7 +8,7 @@
 if (-not ([Security.Principal.WindowsPrincipal] `
     [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(`
     [Security.Principal.WindowsBuiltInRole] "Administrator")) {
-    Write-Error "❌ You must run this script as Administrator."
+    Write-Error " You must run this script as Administrator."
     exit 1
 }
 
@@ -76,17 +76,15 @@ if ($corinaRegistryInstance) {
 } else {
     $logPath = Join-Path $logDir "samantha-update-log.txt"
 }
-"[$(Get-Date)] 🔄 Starting Samantha Uploader (Staging) update..." | Out-File -Append $logPath
+"[$(Get-Date)]  Starting Samantha Uploader (Staging) update..." | Out-File -Append $logPath
 
-# Concurrency guard — only one updater per instance at a time
+# Concurrency guard  only one updater per instance at a time
 $mutexName = if ($corinaRegistryInstance) { "Global\SamanthaStagingUpdater-$corinaRegistryInstance" } else { "Global\SamanthaStagingUpdater" }
 $mutex = New-Object Threading.Mutex($false, $mutexName)
 if (-not $mutex.WaitOne([TimeSpan]::FromMinutes(30))) {
-    "[$(Get-Date)] ⚠️ Another updater instance is already running. Exiting." | Out-File -Append $logPath
+    "[$(Get-Date)]  Another updater instance is already running. Exiting." | Out-File -Append $logPath
     exit 0
 }
-
-try {
 
 # =========================
 # Release Source (unchanged repo/artifacts)
@@ -235,15 +233,15 @@ try {
         if (Test-Path $oldInstallDir) {
             # Robust copy preserving ACLs and attributes
             $rc = robocopy $oldInstallDir $installDir /E /COPYALL /R:2 /W:2 /NFL /NDL /NP /NJH /NJS
-            if ($LASTEXITCODE -gt 8) { throw "Robocopy (old→new) failed with code $LASTEXITCODE" }
+            if ($LASTEXITCODE -gt 8) { throw "Robocopy (oldnew) failed with code $LASTEXITCODE" }
         }
     }
 
     # =========================
-    # Copy extracted files → new install folder (preserve ACLs)
+    # Copy extracted files  new install folder (preserve ACLs)
     # =========================
     $rc2 = robocopy $extractDir $installDir /E /R:2 /W:2 /NFL /NDL /NP /NJH /NJS
-    if ($LASTEXITCODE -gt 8) { throw "Robocopy (extract→install) failed with code $LASTEXITCODE" }
+    if ($LASTEXITCODE -gt 8) { throw "Robocopy (extractinstall) failed with code $LASTEXITCODE" }
 
     if (-not (Test-Path $exePath)) {
         throw "Executable not found at $exePath"
@@ -266,7 +264,7 @@ try {
             Start-Service -Name $newServiceName
             Start-Sleep -Seconds 3
             $svc = Get-Service -Name $newServiceName -ErrorAction Stop
-            if ($svc.Status -ne 'Running') { throw "❌ New service failed to start (status: $($svc.Status))" }
+            if ($svc.Status -ne 'Running') { throw " New service failed to start (status: $($svc.Status))" }
 
             sc.exe delete $oldServiceName | Out-Null
             Start-Sleep -Seconds 1
@@ -290,16 +288,16 @@ try {
     if (Test-Path $oldInstallDir) {
         $ok = Remove-DirRobust -Path $oldInstallDir
         if (-not $ok) {
-            "[$(Get-Date)] ⚠️ Old Corina folder was quarantined; a startup task will delete it on next boot." | Out-File -Append $logPath
+            "[$(Get-Date)]  Old Corina folder was quarantined; a startup task will delete it on next boot." | Out-File -Append $logPath
         } else {
-            "[$(Get-Date)] ✅ Old Corina folder removed." | Out-File -Append $logPath
+            "[$(Get-Date)]  Old Corina folder removed." | Out-File -Append $logPath
         }
     }
 
-    "[$(Get-Date)] ✅ Samantha Uploader (Staging) updated and service running." | Out-File -Append $logPath
+    "[$(Get-Date)]  Samantha Uploader (Staging) updated and service running." | Out-File -Append $logPath
 }
 catch {
-    "[$(Get-Date)] ❌ Update failed: $_" | Out-File -Append $logPath
+    "[$(Get-Date)]  Update failed: $_" | Out-File -Append $logPath
 }
 finally {
     $mutex.ReleaseMutex()
@@ -307,7 +305,7 @@ finally {
 }
 
 # =========================
-# Scheduled Task: migrate old → new, or ensure new with desired times
+# Scheduled Task: migrate old  new, or ensure new with desired times
 # =========================
 $scriptDir = "C:\Scripts"
 if ($corinaRegistryInstance) {
@@ -326,7 +324,7 @@ $_setInst
 try {
     Invoke-Expression (Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-staging-releases/main/daily-updater.ps1" -UseBasicParsing).Content
 } catch {
-    "`n[`$(Get-Date)] ❌ Failed to fetch and run latest updater: `$_" | Out-File -Append "$_logFile"
+    "`n[`$(Get-Date)]  Failed to fetch and run latest updater: `$_" | Out-File -Append "$_logFile"
 }
 "@ | Set-Content -Path $shimPath -Encoding UTF8
 
@@ -377,5 +375,5 @@ try {
     }
 }
 catch {
-    "[$(Get-Date)] ❌ Scheduled task migration/ensure failed: $_" | Out-File -Append $logPath
+    "[$(Get-Date)]  Scheduled task migration/ensure failed: $_" | Out-File -Append $logPath
 }

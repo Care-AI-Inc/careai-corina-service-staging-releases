@@ -1,5 +1,5 @@
-# install-samantha-uploader-staging.ps1
-# Purpose: Clean install or migrate from Corina → Samantha Uploader (Staging) with new service/folder/task names.
+﻿# install-samantha-uploader-staging.ps1
+# Purpose: Clean install or migrate from Corina  Samantha Uploader (Staging) with new service/folder/task names.
 
 # =========================
 # Admin Check
@@ -7,10 +7,10 @@
 if (-not ([Security.Principal.WindowsPrincipal] `
     [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(`
     [Security.Principal.WindowsBuiltInRole] "Administrator")) {
-    Write-Error "❌ You must run this script as Administrator."
+    Write-Error " You must run this script as Administrator."
     exit 1
 }
-Write-Host "✅ Running as Administrator (Samantha Uploader - Staging Installer)"
+Write-Host " Running as Administrator (Samantha Uploader - Staging Installer)"
 
 # =========================
 # Multi-instance bootstrap
@@ -85,11 +85,11 @@ try {
     $zipUrl  = $zipAsset.browser_download_url
     $zipName = $zipAsset.name
 } catch {
-    Write-Error "❌ Failed to fetch staging release or asset info from GitHub: $_"
+    Write-Error " Failed to fetch staging release or asset info from GitHub: $_"
     exit 1
 }
 
-Write-Host "⬇ Downloading staging ZIP: $zipName"
+Write-Host " Downloading staging ZIP: $zipName"
 $zipPath    = Join-Path $env:TEMP $zipName
 $instanceSuffix = if ($corinaRegistryInstance) { "-$corinaRegistryInstance" } else { "" }
 $extractDir = Join-Path $env:TEMP "SamanthaStagingExtract$instanceSuffix"
@@ -123,17 +123,17 @@ $exePath        = Join-Path $newInstallDir $exeName
 # =========================
 foreach ($svc in @($newServiceName, $oldServiceName)) {
     if (Get-Service -Name $svc -ErrorAction SilentlyContinue) {
-        Write-Host "🛑 Stopping service $svc..."
+        Write-Host " Stopping service $svc..."
         Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2
-        Write-Host "🧹 Deleting service $svc..."
+        Write-Host " Deleting service $svc..."
         Stop-ServiceProcessByName -Name $svc
         sc.exe delete $svc | Out-Null
         Start-Sleep -Seconds 2
     }
 }
 # =========================
-# Prepare directories and migration copy (old → new) once
+# Prepare directories and migration copy (old  new) once
 # =========================
 if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
 Expand-Archive -Path $zipPath -DestinationPath $extractDir
@@ -141,25 +141,25 @@ Expand-Archive -Path $zipPath -DestinationPath $extractDir
 if (-not (Test-Path $newInstallDir)) {
     New-Item -ItemType Directory -Path $newInstallDir -Force | Out-Null
     if (Test-Path $oldInstallDir) {
-        Write-Host "📦 Migrating existing files from old folder to new folder..."
+        Write-Host " Migrating existing files from old folder to new folder..."
         $rc = robocopy $oldInstallDir $newInstallDir /E /COPYALL /R:2 /W:2 /NFL /NDL /NP /NJH /NJS
-        if ($LASTEXITCODE -gt 8) { Write-Warning "⚠️ Robocopy (old→new) reported code $LASTEXITCODE" }
+        if ($LASTEXITCODE -gt 8) { Write-Warning " Robocopy (oldnew) reported code $LASTEXITCODE" }
     }
 }
 
-Write-Host "📥 Copying new release files into $newInstallDir ..."
+Write-Host " Copying new release files into $newInstallDir ..."
 $rc2 = robocopy $extractDir $newInstallDir /E /R:2 /W:2 /NFL /NDL /NP /NJH /NJS
-if ($LASTEXITCODE -gt 8) { Write-Warning "⚠️ Robocopy (extract→install) reported code $LASTEXITCODE" }
+if ($LASTEXITCODE -gt 8) { Write-Warning " Robocopy (extractinstall) reported code $LASTEXITCODE" }
 
 if (-not (Test-Path $exePath)) {
-    Write-Error "❌ Failed to find service executable at $exePath"
+    Write-Error " Failed to find service executable at $exePath"
     exit 1
 }
 
 # =========================
 # Register new service and configure recovery
 # =========================
-Write-Host "🆕 Creating Windows service: $newServiceName"
+Write-Host " Creating Windows service: $newServiceName"
 sc.exe create $newServiceName binPath= "`"$exePath`"" start= auto DisplayName= "$serviceDisplayName" | Out-Null
 Set-CorinaServiceEnvironment -Name $newServiceName -Instance $corinaRegistryInstance
 sc.exe failure     $newServiceName reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
@@ -170,10 +170,10 @@ Start-Service -Name $newServiceName
 Start-Sleep -Seconds 3
 $svc = Get-Service -Name $newServiceName -ErrorAction Stop
 if ($svc.Status -ne 'Running') {
-    Write-Error "❌ New service failed to start (status: $($svc.Status)). Aborting."
+    Write-Error " New service failed to start (status: $($svc.Status)). Aborting."
     exit 1
 }
-Write-Host "✅ Service '$newServiceName' is running."
+Write-Host " Service '$newServiceName' is running."
 
 # =========================
 # Scheduled Task: remove old, create new
@@ -202,13 +202,13 @@ $_setInst
 try {
     Invoke-Expression (Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-staging-releases/main/daily-updater.ps1" -UseBasicParsing).Content
 } catch {
-    "`n[`$(Get-Date)] ❌ Failed to fetch and run latest updater: `$_" | Out-File -Append "$_logFile"
+    "`n[`$(Get-Date)]  Failed to fetch and run latest updater: `$_" | Out-File -Append "$_logFile"
 }
 "@ | Set-Content -Path $newShimPath -Encoding UTF8
 
 # Remove legacy task if present
 if (Get-ScheduledTask -TaskName $oldTaskName -ErrorAction SilentlyContinue) {
-    Write-Host "🗑 Removing old scheduled task '$oldTaskName'"
+    Write-Host " Removing old scheduled task '$oldTaskName'"
     Unregister-ScheduledTask -TaskName $oldTaskName -Confirm:$false
     Start-Sleep -Seconds 1
 }
@@ -235,18 +235,18 @@ if (Get-ScheduledTask -TaskName $newTaskName -ErrorAction SilentlyContinue) {
 }
 
 Register-ScheduledTask -TaskName $newTaskName -Action $action -Trigger $trigger1, $trigger2, $trigger3, $trigger4, $trigger5, $trigger6 -Principal $principal
-Write-Host "📅 Scheduled task '$newTaskName' created with 6 triggers."
+Write-Host " Scheduled task '$newTaskName' created with 6 triggers."
 
 # =========================
 # Clean up old install folder (safe to remove now)
 # =========================
 if (Test-Path $oldInstallDir) {
     try {
-        Write-Host "🧼 Removing old install directory: $oldInstallDir"
+        Write-Host " Removing old install directory: $oldInstallDir"
         Remove-Item -Recurse -Force $oldInstallDir
     } catch {
-        Write-Warning "⚠️ Could not fully delete $oldInstallDir; you can remove it later."
+        Write-Warning " Could not fully delete $oldInstallDir; you can remove it later."
     }
 }
 
-Write-Host "🎉 Samantha Uploader (Staging) installed and configured successfully!"
+Write-Host " Samantha Uploader (Staging) installed and configured successfully!"
