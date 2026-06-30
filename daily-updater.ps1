@@ -115,19 +115,20 @@ if ($corinaRegistryInstance) {
     $serviceDisplayName = "Samantha Uploader (Staging)"
 }
 $exePath        = Join-Path $installDir $exeName
+$defaultCorinaBackendBaseUrl = "https://backend.staging.caregp.com.au"
 
 function Get-CorinaBackendBaseUrlFromRegistry {
     param([Parameter(Mandatory=$true)][string]$RegPath)
 
     $props = Get-ItemProperty -Path $RegPath -ErrorAction SilentlyContinue
-    if (-not $props) { return $null }
+    if (-not $props) { return $defaultCorinaBackendBaseUrl }
 
     if (-not [string]::IsNullOrWhiteSpace($props.SamanthaBaseUrl)) {
         return ([string]$props.SamanthaBaseUrl).TrimEnd('/')
     }
 
     $samanthaUrl = [string]$props.SamanthaUrl
-    if ([string]::IsNullOrWhiteSpace($samanthaUrl)) { return $null }
+    if ([string]::IsNullOrWhiteSpace($samanthaUrl)) { return $defaultCorinaBackendBaseUrl }
 
     foreach ($suffix in @(
         "/corina/analyse-with-gemini-for-corina-service",
@@ -143,7 +144,7 @@ function Get-CorinaBackendBaseUrlFromRegistry {
         $uri = [Uri]$samanthaUrl
         return $uri.GetLeftPart([UriPartial]::Authority).TrimEnd('/')
     } catch {
-        return $null
+        return $defaultCorinaBackendBaseUrl
     }
 }
 
