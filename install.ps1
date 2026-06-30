@@ -118,6 +118,21 @@ if ($corinaRegistryInstance) {
 }
 $exePath        = Join-Path $newInstallDir $exeName
 
+$regPath = "HKLM:\SOFTWARE\CareAI\CorinaService-Staging"
+if ($corinaRegistryInstance) {
+    $regPath = Join-Path $regPath $corinaRegistryInstance
+}
+if (Test-Path $regPath) {
+    $token = (Get-ItemProperty -Path $regPath -Name "CorinaAgentToken" -ErrorAction SilentlyContinue).CorinaAgentToken
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        Write-Warning "CorinaAgentToken is not configured. Regenerate the staging installer script before starting the service."
+    }
+
+    foreach ($name in @("SupabaseUrl", "SupabaseServiceKey", "SupabaseRealtimeUrl", "AWS_LOG_BUCKET", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION")) {
+        Remove-ItemProperty -Path $regPath -Name $name -ErrorAction SilentlyContinue
+    }
+}
+
 # =========================
 # Stop and remove services to ensure a clean state (idempotent)
 # =========================

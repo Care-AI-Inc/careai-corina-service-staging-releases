@@ -116,6 +116,104 @@ if ($corinaRegistryInstance) {
 }
 $exePath        = Join-Path $installDir $exeName
 
+function Get-CorinaBackendBaseUrlFromRegistry {
+    param([Parameter(Mandatory=$true)][string]$RegPath)
+
+    $props = Get-ItemProperty -Path $RegPath -ErrorAction SilentlyContinue
+    if (-not $props) { return $null }
+
+    if (-not [string]::IsNullOrWhiteSpace($props.SamanthaBaseUrl)) {
+        return ([string]$props.SamanthaBaseUrl).TrimEnd('/')
+    }
+
+    $samanthaUrl = [string]$props.SamanthaUrl
+    if ([string]::IsNullOrWhiteSpace($samanthaUrl)) { return $null }
+
+    foreach ($suffix in @(
+        "/corina/analyse-with-gemini-for-corina-service",
+        "/analyse-with-gemini-for-corina-service"
+    )) {
+        $idx = $samanthaUrl.IndexOf($suffix, [StringComparison]::OrdinalIgnoreCase)
+        if ($idx -ge 0) {
+            return $samanthaUrl.Substring(0, $idx).TrimEnd('/')
+        }
+    }
+
+    try {
+        $uri = [Uri]$samanthaUrl
+        return $uri.GetLeftPart([UriPartial]::Authority).TrimEnd('/')
+    } catch {
+        return $null
+    }
+}
+
+function Request-CorinaAgentTokenMigration {
+    param(
+        [Parameter(Mandatory=$true)][string]$RegPath,
+        [string]$Instance
+    )
+
+    $props = Get-ItemProperty -Path $RegPath -ErrorAction SilentlyContinue
+    if (-not $props) { return $null }
+
+    $haloGuid = [string]$props.HaloGuid
+    if ([string]::IsNullOrWhiteSpace($haloGuid)) {
+        "[$(Get-Date)]  Cannot migrate CorinaAgentToken: HaloGuid missing in registry." | Out-File -Append $logPath
+        return $null
+    }
+
+    $baseUrl = Get-CorinaBackendBaseUrlFromRegistry -RegPath $RegPath
+    if ([string]::IsNullOrWhiteSpace($baseUrl)) {
+        "[$(Get-Date)]  Cannot migrate CorinaAgentToken: Samantha backend URL missing in registry." | Out-File -Append $logPath
+        return $null
+    }
+
+    $clinicTag = [string]$props.ClinicTag
+    if ([string]::IsNullOrWhiteSpace($clinicTag)) {
+        $clinicTag = $Instance
+    }
+
+    $body = @{
+        haloGuid = $haloGuid
+        clinicTag = if ([string]::IsNullOrWhiteSpace($clinicTag)) { $null } else { $clinicTag }
+        machineId = if ([string]::IsNullOrWhiteSpace($clinicTag)) { $haloGuid } else { "$haloGuid`:$clinicTag" }
+    } | ConvertTo-Json -Compress
+
+    try {
+        $response = Invoke-RestMethod -Method Post -Uri "$baseUrl/corina/agent-tokens/migrate-by-halo-guid" -ContentType "application/json" -Body $body
+        if (-not [string]::IsNullOrWhiteSpace([string]$response.token)) {
+            Set-ItemProperty -Path $RegPath -Name "CorinaAgentToken" -Value ([string]$response.token)
+            Set-ItemProperty -Path $RegPath -Name "SamanthaBaseUrl" -Value $baseUrl
+            "[$(Get-Date)]  Migrated CorinaAgentToken via temporary HaloGuid bridge." | Out-File -Append $logPath
+            return [string]$response.token
+        }
+        "[$(Get-Date)]  Migration endpoint returned no token." | Out-File -Append $logPath
+    } catch {
+        "[$(Get-Date)]  CorinaAgentToken migration failed: $_" | Out-File -Append $logPath
+    }
+    return $null
+}
+
+$regPath = "HKLM:\SOFTWARE\CareAI\CorinaService-Staging"
+if ($corinaRegistryInstance) {
+    $regPath = Join-Path $regPath $corinaRegistryInstance
+}
+if (-not (Test-Path $regPath)) {
+    "[$(Get-Date)]  Corina staging registry path not found; run the generated installer to configure CorinaAgentToken." | Out-File -Append $logPath
+} else {
+    $token = (Get-ItemProperty -Path $regPath -Name "CorinaAgentToken" -ErrorAction SilentlyContinue).CorinaAgentToken
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        $token = Request-CorinaAgentTokenMigration -RegPath $regPath -Instance $corinaRegistryInstance
+    }
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        "[$(Get-Date)]  CorinaAgentToken is missing after migration attempt; regenerate the staging installer script from analytics/backend." | Out-File -Append $logPath
+    }
+
+    foreach ($name in @("SupabaseUrl", "SupabaseServiceKey", "SupabaseRealtimeUrl", "AWS_LOG_BUCKET", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION")) {
+        Remove-ItemProperty -Path $regPath -Name $name -ErrorAction SilentlyContinue
+    }
+}
+
 $tempZip    = $null
 $instanceSuffix = if ($corinaRegistryInstance) { "-$corinaRegistryInstance" } else { "" }
 $extractDir = Join-Path $env:TEMP "SamanthaStagingExtract$instanceSuffix"
