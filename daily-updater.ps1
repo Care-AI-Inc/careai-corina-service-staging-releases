@@ -1,6 +1,5 @@
 # daily-updater-staging.ps1
-# Purpose: Keep Samantha Uploader (Staging) up to date and finish migration from Corina if any remnants exist.
-# Includes robust cleanup to handle locked files (e.g., logs).
+# Purpose: Keep Corina Service (Staging) up to date.
 
 # =========================
 # Admin Check
@@ -8,7 +7,7 @@
 if (-not ([Security.Principal.WindowsPrincipal] `
     [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(`
     [Security.Principal.WindowsBuiltInRole] "Administrator")) {
-    Write-Error " You must run this script as Administrator."
+    Write-Error "You must run this script as Administrator."
     exit 1
 }
 
@@ -72,47 +71,98 @@ $corinaRegistryInstance = Get-CorinaRegistryInstance
 $logDir  = "C:\Scripts"
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
 if ($corinaRegistryInstance) {
-    $logPath = Join-Path $logDir "samantha-update-log-$corinaRegistryInstance.txt"
+    $logPath = Join-Path $logDir "corina-staging-update-log-$corinaRegistryInstance.txt"
 } else {
-    $logPath = Join-Path $logDir "samantha-update-log.txt"
+    $logPath = Join-Path $logDir "corina-staging-update-log.txt"
 }
-"[$(Get-Date)]  Starting Samantha Uploader (Staging) update..." | Out-File -Append $logPath
 
-# Concurrency guard  only one updater per instance at a time
-$mutexName = if ($corinaRegistryInstance) { "Global\SamanthaStagingUpdater-$corinaRegistryInstance" } else { "Global\SamanthaStagingUpdater" }
+# Structured log writer. Every line keeps the timestamp prefix; the level renders a
+# scannable status column that mirrors the console style of the installer/shim:
+#   STEP   -> "[*] "     section header
+#   DETAIL -> "    -> "  progress detail inside a section
+#   OK     -> "[OK] "    section finished successfully
+#   FAIL   -> "[FAIL] "  section failed
+#   WARN   -> "[WARN] "  non-fatal problem
+#   INFO   -> no prefix  free-form line
+function Write-Log {
+    param(
+        [Parameter(Mandatory=$true)][string]$Message,
+        [ValidateSet('INFO','STEP','OK','FAIL','WARN','DETAIL')][string]$Level = 'DETAIL'
+    )
+    $prefix = switch ($Level) {
+        'STEP'   { '[*] ' }
+        'OK'     { '[OK] ' }
+        'FAIL'   { '[FAIL] ' }
+        'WARN'   { '[WARN] ' }
+        'DETAIL' { '    -> ' }
+        default  { '' }
+    }
+    "[$(Get-Date)] $prefix$Message" | Out-File -Append $logPath
+}
+
+Write-Log "Corina Service (Staging) updater started" 'INFO'
+
+# =========================
+# Force TLS 1.2 (required for GitHub; old .NET/PS 5.1 defaults to TLS 1.0)
+# =========================
+# The shim sets this too, but only for its own process; this script runs in a
+# fresh child process, so it must set it again itself.
+try {
+    $proto = [System.Net.ServicePointManager]::SecurityProtocol
+    $tls12 = [System.Net.SecurityProtocolType]::Tls12
+    if (($proto -band $tls12) -eq 0) {
+        [System.Net.ServicePointManager]::SecurityProtocol = $proto -bor $tls12
+    }
+} catch {
+    Write-Log "Failed to enable TLS 1.2: $_" 'WARN'
+}
+
+# Concurrency guard  only one updater per instance at a time.
+# Wait 5 minutes at most: if the lock is still busy, another updater is actively
+# running and this round is redundant (the next trigger is at most 2 hours away).
+$mutexName = if ($corinaRegistryInstance) { "Global\CorinaStagingUpdater-$corinaRegistryInstance" } else { "Global\CorinaStagingUpdater" }
 $mutex = New-Object Threading.Mutex($false, $mutexName)
-if (-not $mutex.WaitOne([TimeSpan]::FromMinutes(30))) {
-    "[$(Get-Date)]  Another updater instance is already running. Exiting." | Out-File -Append $logPath
+$mutexAcquired = $false
+try {
+    $mutexAcquired = $mutex.WaitOne([TimeSpan]::FromMinutes(5))
+} catch [System.Threading.AbandonedMutexException] {
+    # The previous holder was killed without releasing (e.g. powershell ended via
+    # Task Manager). Despite the exception, ownership HAS passed to us; treat it as
+    # acquired and continue -- the verify/backup/rollback flow below cleans up any
+    # half-finished state the dead run left behind.
+    Write-Log "Previous updater was killed without releasing the lock; continuing with this run." 'WARN'
+    $mutexAcquired = $true
+}
+if (-not $mutexAcquired) {
+    Write-Log "Another updater instance is already running. Exiting." 'WARN'
     exit 0
 }
+
+# Set on update failure so the script exits non-zero and the shim/scheduled task
+# report the failure instead of always showing success.
+$script:updateFailed = $false
 
 # =========================
 # Release Source (unchanged repo/artifacts)
 # =========================
 $repo   = "Care-AI-Inc/careai-corina-service-staging-releases"
 $apiUrl = "https://api.github.com/repos/$repo/releases/latest"
-$headers = @{ "User-Agent" = "SamanthaUploaderStagingUpdater" }
+$headers = @{ "User-Agent" = "CorinaServiceStagingUpdater" }
 
 # =========================
 # Names and Paths
 # =========================
 $exeName        = "careai-corina-service.exe"  # keep current exe name; change later when your releases do
 if ($corinaRegistryInstance) {
-    $newServiceName = "SamanthaUploader_Staging-$corinaRegistryInstance"
-    $oldServiceName = "CorinaService_Staging-$corinaRegistryInstance"
-    $newTaskName    = "SamanthaDailyUpdater-$corinaRegistryInstance"
-    $oldTaskName    = "CorinaDailyUpdater-$corinaRegistryInstance"
-    $installDir     = Join-Path (Join-Path ${env:ProgramFiles} "SamanthaUploader_Staging") $corinaRegistryInstance
-    $oldInstallDir  = Join-Path (Join-Path ${env:ProgramFiles} "CorinaService_Staging") $corinaRegistryInstance
-    $serviceDisplayName = "Samantha Uploader (Staging - $corinaRegistryInstance)"
+    $newServiceName = "CorinaService-Staging-$corinaRegistryInstance"
+    $newTaskName    = "CorinaStagingDailyUpdater-$corinaRegistryInstance"
+    $installDir     = Join-Path (Join-Path ${env:ProgramFiles} "CorinaService-Staging") $corinaRegistryInstance
+    $serviceDisplayName = "Corina Service (Staging - $corinaRegistryInstance)"
 } else {
-    $newServiceName = "SamanthaUploader_Staging"
-    $oldServiceName = "CorinaService_Staging"
-    $newTaskName    = "SamanthaDailyUpdater"
-    $oldTaskName    = "CorinaDailyUpdater"
-    $installDir     = Join-Path ${env:ProgramFiles} "SamanthaUploader_Staging"
-    $oldInstallDir  = Join-Path ${env:ProgramFiles} "CorinaService_Staging"
-    $serviceDisplayName = "Samantha Uploader (Staging)"
+    $newServiceName = "CorinaService-Staging"
+    $newTaskName    = "CorinaStagingDailyUpdater"
+    $installDir     = Join-Path ${env:ProgramFiles} "CorinaService-Staging"
+    $serviceDisplayName = "Corina Service (Staging)"
 }
 $exePath        = Join-Path $installDir $exeName
 $defaultCorinaBackendBaseUrl = "https://backend.staging.caregp.com.au"
@@ -159,13 +209,13 @@ function Request-CorinaAgentTokenMigration {
 
     $haloGuid = [string]$props.HaloGuid
     if ([string]::IsNullOrWhiteSpace($haloGuid)) {
-        "[$(Get-Date)]  Cannot migrate CorinaAgentToken: HaloGuid missing in registry." | Out-File -Append $logPath
+        Write-Log "cannot migrate CorinaAgentToken: HaloGuid missing in registry" 'WARN'
         return $null
     }
 
     $baseUrl = Get-CorinaBackendBaseUrlFromRegistry -RegPath $RegPath
     if ([string]::IsNullOrWhiteSpace($baseUrl)) {
-        "[$(Get-Date)]  Cannot migrate CorinaAgentToken: Samantha backend URL missing in registry." | Out-File -Append $logPath
+        Write-Log "cannot migrate CorinaAgentToken: Samantha backend URL missing in registry" 'WARN'
         return $null
     }
 
@@ -181,16 +231,18 @@ function Request-CorinaAgentTokenMigration {
     } | ConvertTo-Json -Compress
 
     try {
-        $response = Invoke-RestMethod -Method Post -Uri "$baseUrl/corina/agent-tokens/migrate-by-halo-guid" -ContentType "application/json" -Body $body
+        $response = Invoke-RestMethod -Method Post -Uri "$baseUrl/corina/agent-tokens/migrate-by-halo-guid" -ContentType "application/json" -Body $body -TimeoutSec 30
         if (-not [string]::IsNullOrWhiteSpace([string]$response.token)) {
             Set-ItemProperty -Path $RegPath -Name "CorinaAgentToken" -Value ([string]$response.token)
             Set-ItemProperty -Path $RegPath -Name "SamanthaBaseUrl" -Value $baseUrl
-            "[$(Get-Date)]  Migrated CorinaAgentToken via temporary HaloGuid bridge." | Out-File -Append $logPath
+            # WARN, not OK: a brand-new token being minted outside the installer is
+            # unexpected and worth spotting when scanning the log.
+            Write-Log "migrated CorinaAgentToken via temporary HaloGuid bridge (a NEW token was issued)" 'WARN'
             return [string]$response.token
         }
-        "[$(Get-Date)]  Migration endpoint returned no token." | Out-File -Append $logPath
+        Write-Log "migration endpoint returned no token" 'WARN'
     } catch {
-        "[$(Get-Date)]  CorinaAgentToken migration failed: $_" | Out-File -Append $logPath
+        Write-Log "CorinaAgentToken migration failed: $_" 'WARN'
     }
     return $null
 }
@@ -199,102 +251,39 @@ $regPath = "HKLM:\SOFTWARE\CareAI\CorinaService-Staging"
 if ($corinaRegistryInstance) {
     $regPath = Join-Path $regPath $corinaRegistryInstance
 }
+Write-Log "Registry / token check" 'STEP'
+Write-Log "registry path: $regPath"
 if (-not (Test-Path $regPath)) {
-    "[$(Get-Date)]  Corina staging registry path not found; run the generated installer to configure CorinaAgentToken." | Out-File -Append $logPath
+    Write-Log "registry path not found; run the generated installer to configure CorinaAgentToken" 'FAIL'
 } else {
     $token = (Get-ItemProperty -Path $regPath -Name "CorinaAgentToken" -ErrorAction SilentlyContinue).CorinaAgentToken
     if ([string]::IsNullOrWhiteSpace($token)) {
+        Write-Log "CorinaAgentToken missing; attempting HaloGuid migration"
         $token = Request-CorinaAgentTokenMigration -RegPath $regPath -Instance $corinaRegistryInstance
     }
     if ([string]::IsNullOrWhiteSpace($token)) {
-        "[$(Get-Date)]  CorinaAgentToken is missing after migration attempt; regenerate the staging installer script from analytics/backend." | Out-File -Append $logPath
-    }
-
-    foreach ($name in @("SupabaseUrl", "SupabaseServiceKey", "SupabaseRealtimeUrl", "AWS_LOG_BUCKET", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION")) {
-        Remove-ItemProperty -Path $regPath -Name $name -ErrorAction SilentlyContinue
+        Write-Log "CorinaAgentToken is missing after migration attempt; regenerate the staging installer script from analytics/backend" 'FAIL'
+        # Keep the legacy Supabase/AWS values: a machine still on an old binary needs
+        # them to keep running, and deleting them here with no token would leave it
+        # with neither auth path if this update round also fails.
+    } else {
+        foreach ($name in @("SupabaseUrl", "SupabaseServiceKey", "SupabaseRealtimeUrl", "AWS_LOG_BUCKET", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION")) {
+            Remove-ItemProperty -Path $regPath -Name $name -ErrorAction SilentlyContinue
+        }
+        Write-Log "CorinaAgentToken present" 'OK'
     }
 }
 
 $tempZip    = $null
 $instanceSuffix = if ($corinaRegistryInstance) { "-$corinaRegistryInstance" } else { "" }
-$extractDir = Join-Path $env:TEMP "SamanthaStagingExtract$instanceSuffix"
-
-# =========================
-# Robust directory removal helper
-# =========================
-function Remove-DirRobust {
-    param(
-        [Parameter(Mandatory=$true)][string]$Path,
-        [int]$Retries = 3,
-        [int]$DelaySeconds = 2
-    )
-
-    # 0) Best-effort: ensure this instance is not holding the folder
-    Stop-ServiceProcessByName -Name $newServiceName
-    Stop-ServiceProcessByName -Name $oldServiceName
-    Start-Sleep -Seconds 1
-
-    # 1) Try a straight delete a few times
-    for ($i=1; $i -le $Retries; $i++) {
-        try {
-            if (Test-Path $Path) {
-                # Clear read-only attributes just in case
-                Get-ChildItem -LiteralPath $Path -Force -Recurse -ErrorAction SilentlyContinue |
-                    ForEach-Object { try { $_.Attributes = 'Normal' } catch {} }
-
-                Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
-            }
-            return $true
-        } catch {
-            Start-Sleep -Seconds $DelaySeconds
-        }
-    }
-
-    # 2) Use robocopy MIR trick to clear most contents (leaves only locked files)
-    if (Test-Path $Path) {
-        $empty = Join-Path $env:TEMP ("empty_" + [guid]::NewGuid())
-        New-Item -ItemType Directory -Path $empty | Out-Null
-        $rc = robocopy $empty $Path /MIR /R:1 /W:1 /NFL /NDL /NP /NJH /NJS
-        Remove-Item -LiteralPath $empty -Recurse -Force -ErrorAction SilentlyContinue
-        try {
-            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
-            return $true
-        } catch { }
-    }
-
-    # 3) Quarantine (rename) the folder, then schedule a one-shot delete at next boot
-    if (Test-Path $Path) {
-        $stamp = Get-Date -Format "yyyyMMddHHmmss"
-        $quarantine = "$Path._stale_$stamp"
-        try {
-            Rename-Item -LiteralPath $Path -NewName (Split-Path $quarantine -Leaf) -ErrorAction Stop
-        } catch {
-            return $false  # rename failed; next run will retry
-        }
-
-        # Create a self-deleting startup task to remove the quarantined folder on next boot
-        $taskName  = "SamanthaCleanupOldCorina_$stamp"
-        $cmd       = "cmd.exe"
-        $args      = "/c rmdir /s /q `"$quarantine`" && schtasks /Delete /TN `"$taskName`" /F"
-
-        $action    = New-ScheduledTaskAction -Execute $cmd -Argument $args
-        $trigger   = New-ScheduledTaskTrigger -AtStartup
-        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-        try {
-            Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal | Out-Null
-        } catch { }
-
-        return $false  # not gone now, but will be removed at next boot
-    }
-
-    return $true
-}
+$extractDir = Join-Path $env:TEMP "CorinaServiceStagingExtract$instanceSuffix"
 
 try {
     # =========================
     # Fetch latest ZIP asset
     # =========================
-    $response = Invoke-RestMethod -Uri $apiUrl -Headers $headers
+    Write-Log "Download and verify release payload" 'STEP'
+    $response = Invoke-RestMethod -Uri $apiUrl -Headers $headers -TimeoutSec 30
     $zipAsset = $response.assets | Where-Object { $_.name -like '*.zip' } | Select-Object -First 1
     if (-not $zipAsset) { throw "No .zip asset found in latest release." }
 
@@ -302,8 +291,10 @@ try {
     $zipName = $zipAsset.name
     $zipBaseName = [System.IO.Path]::GetFileNameWithoutExtension($zipName)
     $tempZip = Join-Path $env:TEMP "$zipBaseName$instanceSuffix.zip"
+    Write-Log "release asset: $zipName"
 
-    Invoke-WebRequest -Uri $zipUrl -OutFile $tempZip
+    Invoke-WebRequest -Uri $zipUrl -OutFile $tempZip -UseBasicParsing -TimeoutSec 300
+    Write-Log "downloaded to $tempZip"
 
     # =========================
     # Prepare extraction
@@ -345,12 +336,13 @@ try {
             throw "Staged version $stagedVer is older than installed $curVer; refusing downgrade"
         }
     }
-    "[$(Get-Date)]  Staged payload verified: exe=$exeName version=$stagedVer files=$stagedCount" | Out-File -Append $logPath
+    Write-Log "payload verified: exe=$exeName version=$stagedVer files=$stagedCount" 'OK'
 
     # =========================
     # Back up the current install so we can roll back
     # =========================
-    $backupDir = Join-Path $env:TEMP "SamanthaStagingBackup$instanceSuffix"
+    Write-Log "Back up current install" 'STEP'
+    $backupDir = Join-Path $env:TEMP "CorinaServiceStagingBackup$instanceSuffix"
     $haveBackup = $false
     if (Test-Path $backupDir) { Remove-Item -Recurse -Force $backupDir }
     if (Test-Path $installDir) {
@@ -358,32 +350,32 @@ try {
         & robocopy "$installDir" "$backupDir" * /E /COPY:DAT /R:5 /W:3 /NFL /NDL /NP /NJH /NJS | Out-Null
         if ($LASTEXITCODE -ge 8) { throw "Backup of current install failed (robocopy exit $LASTEXITCODE)" }
         $haveBackup = $true
-        "[$(Get-Date)]  Backed up current install to $backupDir" | Out-File -Append $logPath
+        Write-Log "backed up current install to $backupDir" 'OK'
+    } else {
+        Write-Log "no existing install directory; skipping backup"
     }
 
     # =========================
     # Only NOW stop the service (payload verified + backup taken) -- minimal downtime
     # =========================
+    Write-Log "Stop service and deploy new files" 'STEP'
     $svcToStop = Get-Service -Name $newServiceName -ErrorAction SilentlyContinue
-    if (-not $svcToStop) { $svcToStop = Get-Service -Name $oldServiceName -ErrorAction SilentlyContinue }
     if ($svcToStop) {
         Stop-Service -Name $svcToStop.Name -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2
         # Best-effort kill of this lingering service process
         Stop-ServiceProcessByName -Name $svcToStop.Name
         Start-Sleep -Seconds 1
+        Write-Log "service '$($svcToStop.Name)' stopped"
+    } else {
+        Write-Log "service '$newServiceName' not present yet; nothing to stop"
     }
 
     # =========================
-    # Ensure new install directory exists; if migrating, copy old -> new once
+    # Ensure new install directory exists
     # =========================
     if (-not (Test-Path $installDir)) {
         New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-        if (Test-Path $oldInstallDir) {
-            # Robust copy preserving ACLs and attributes
-            $rc = robocopy $oldInstallDir $installDir /E /COPYALL /R:2 /W:2 /NFL /NDL /NP /NJH /NJS
-            if ($LASTEXITCODE -gt 8) { throw "Robocopy (oldnew) failed with code $LASTEXITCODE" }
-        }
     }
 
     # =========================
@@ -393,7 +385,7 @@ try {
     $rc2 = $LASTEXITCODE
     if ($rc2 -ge 8) {
         if ($haveBackup) {
-            "[$(Get-Date)]  Deploy robocopy failed (exit $rc2); restoring previous version." | Out-File -Append $logPath
+            Write-Log "deploy robocopy failed (exit $rc2); restoring previous version" 'FAIL'
             & robocopy "$backupDir" "$installDir" * /MIR /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
             if ($svcToStop) {
                 Set-CorinaServiceEnvironment -Name $svcToStop.Name -Instance $corinaRegistryInstance
@@ -407,39 +399,21 @@ try {
     if (-not (Test-Path $exePath)) {
         throw "Executable not found at $exePath"
     }
+    Write-Log "new files deployed to $installDir" 'OK'
 
     # =========================
-    # Ensure service is the NEW name; migrate if needed
+    # Ensure the service exists, then start it
     # =========================
+    Write-Log "Start service and health check" 'STEP'
     $hasNew = Get-Service -Name $newServiceName -ErrorAction SilentlyContinue
-    $hasOld = Get-Service -Name $oldServiceName -ErrorAction SilentlyContinue
-
     if (-not $hasNew) {
-        if ($hasOld) {
-            # Create new service, start it, then remove old
-            sc.exe create $newServiceName binPath= "`"$exePath`"" start= auto DisplayName= "$serviceDisplayName" | Out-Null
-            Set-CorinaServiceEnvironment -Name $newServiceName -Instance $corinaRegistryInstance
-            sc.exe failure     $newServiceName reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
-            sc.exe failureflag $newServiceName 1 | Out-Null
-
-            Start-Service -Name $newServiceName
-            Start-Sleep -Seconds 3
-            $svc = Get-Service -Name $newServiceName -ErrorAction Stop
-            if ($svc.Status -ne 'Running') { throw " New service failed to start (status: $($svc.Status))" }
-
-            sc.exe delete $oldServiceName | Out-Null
-            Start-Sleep -Seconds 1
-        } else {
-            # Neither exists  create new cleanly
-            sc.exe create $newServiceName binPath= "`"$exePath`"" start= auto DisplayName= "$serviceDisplayName" | Out-Null
-            Set-CorinaServiceEnvironment -Name $newServiceName -Instance $corinaRegistryInstance
-            sc.exe failure     $newServiceName reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
-            sc.exe failureflag $newServiceName 1 | Out-Null
-            # Health check below decides success; roll back there instead of failing hard here
-            Start-Service -Name $newServiceName -ErrorAction SilentlyContinue
-        }
+        sc.exe create $newServiceName binPath= "`"$exePath`"" start= auto DisplayName= "$serviceDisplayName" | Out-Null
+        Set-CorinaServiceEnvironment -Name $newServiceName -Instance $corinaRegistryInstance
+        sc.exe failure     $newServiceName reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
+        sc.exe failureflag $newServiceName 1 | Out-Null
+        # Health check below decides success; roll back there instead of failing hard here
+        Start-Service -Name $newServiceName -ErrorAction SilentlyContinue
     } else {
-        # New exists  start it
         Set-CorinaServiceEnvironment -Name $newServiceName -Instance $corinaRegistryInstance
         Start-Service -Name $newServiceName -ErrorAction SilentlyContinue
     }
@@ -463,7 +437,7 @@ try {
 
     if (-not $healthy) {
         if ($haveBackup) {
-            "[$(Get-Date)]  Service did not stay Running after update; restoring previous version." | Out-File -Append $logPath
+            Write-Log "service did not stay Running after update; restoring previous version" 'FAIL'
             Stop-Service -Name $newServiceName -Force -ErrorAction SilentlyContinue
             & robocopy "$backupDir" "$installDir" * /MIR /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
             Set-CorinaServiceEnvironment -Name $newServiceName -Instance $corinaRegistryInstance
@@ -474,21 +448,24 @@ try {
     }
 
     # =========================
-    # Clean up old install folder (robust)
+    # Clean up temp artifacts on success: this run's zip + extracted payload, plus
+    # stale zips left by older versions (each release has a unique file name, so
+    # they accumulate in SYSTEM's temp otherwise). On failure this is skipped and
+    # the zip stays behind for diagnostics; the next successful run sweeps it up.
+    # The backup dir is intentionally kept until the next run as a manual-rollback
+    # artifact; its name is fixed, so it never accumulates.
     # =========================
-    if (Test-Path $oldInstallDir) {
-        $ok = Remove-DirRobust -Path $oldInstallDir
-        if (-not $ok) {
-            "[$(Get-Date)]  Old Corina folder was quarantined; a startup task will delete it on next boot." | Out-File -Append $logPath
-        } else {
-            "[$(Get-Date)]  Old Corina folder removed." | Out-File -Append $logPath
-        }
-    }
+    Remove-Item -LiteralPath $tempZip -Force -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $extractDir -ErrorAction SilentlyContinue
+    Get-ChildItem -Path $env:TEMP -Filter "corina-staging-*.zip" -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
 
-    "[$(Get-Date)]  Samantha Uploader (Staging) updated to v$stagedVer and service running." | Out-File -Append $logPath
+    Write-Log "update complete: v$stagedVer deployed and service '$newServiceName' running" 'OK'
 }
 catch {
-    "[$(Get-Date)]  Update failed: $_" | Out-File -Append $logPath
+    Write-Log "Update failed: $_" 'FAIL'
+    $script:updateFailed = $true
 }
 finally {
     $mutex.ReleaseMutex()
@@ -496,79 +473,35 @@ finally {
 }
 
 # =========================
-# Scheduled Task: migrate old  new, or ensure new with desired times
+# Scheduled Task: write shim and ensure desired times
 # =========================
-$scriptDir = "C:\Scripts"
-if ($corinaRegistryInstance) {
-    $shimPath  = Join-Path $scriptDir "run-daily-updater-staging-$corinaRegistryInstance.ps1"
-} else {
-    $shimPath  = Join-Path $scriptDir "run-daily-updater-staging.ps1"
-}
-
-# Always overwrite shim so instance name stays current and manual runs work without env var
-if (-not (Test-Path $scriptDir)) { New-Item -ItemType Directory -Path $scriptDir | Out-Null }
-$_logFile = if ($corinaRegistryInstance) { "C:\Scripts\samantha-update-log-$corinaRegistryInstance.txt" } else { "C:\Scripts\samantha-update-log.txt" }
-$_setInst = if ($corinaRegistryInstance) { "`$env:CorinaRegistryInstance = '$corinaRegistryInstance'" } else { "" }
-@"
-$_setInst
-`$env:DOTNET_ENVIRONMENT = 'Staging'
+# Ensure-CorinaStagingUpdaterTask lives in a shared script (also used by install.ps1).
+# This script runs from a temp file on clinic machines, so the helper must be fetched
+# from the release repo rather than dot-sourced from disk.
 try {
-    `$content = (Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-staging-releases/main/daily-updater.ps1" -UseBasicParsing).Content
-    if (`$content.Length -gt 0 -and `$content[0] -eq [char]0xFEFF) {
-        `$content = `$content.Substring(1)
-    }
-    Invoke-Expression `$content
-} catch {
-    "`n[`$(Get-Date)]  Failed to fetch and run latest updater: `$_" | Out-File -Append "$_logFile"
-}
-"@ | Set-Content -Path $shimPath -Encoding UTF8
+    Write-Log "Refresh updater shim and scheduled task" 'STEP'
+    $ensureTaskUrl = "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-staging-releases/main/ensure-updater-task.ps1"
+    Invoke-RestMethod -Uri $ensureTaskUrl -Headers $headers -TimeoutSec 30 | Invoke-Expression
 
-try {
+    # Tagged installs must not leave the old single-instance task running in parallel.
+    $taskNamesToRemove = @()
     if ($corinaRegistryInstance) {
-        $taskArgument = "-NoProfile -ExecutionPolicy Bypass -Command `"`$env:CorinaRegistryInstance='$corinaRegistryInstance'; `$env:DOTNET_ENVIRONMENT='Staging'; & '$shimPath'`""
-    } else {
-        $taskArgument = "-NoProfile -ExecutionPolicy Bypass -File `"$shimPath`""
+        $taskNamesToRemove += "CorinaStagingDailyUpdater"
     }
-    $taskAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $taskArgument
-
-    if (Get-ScheduledTask -TaskName $oldTaskName -ErrorAction SilentlyContinue) {
-        $oldTask = Get-ScheduledTask -TaskName $oldTaskName
-        $trigs   = $oldTask.Triggers
-        Unregister-ScheduledTask -TaskName $oldTaskName -Confirm:$false
-        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-        Register-ScheduledTask -TaskName $newTaskName -Action $taskAction -Trigger $trigs -Principal $principal | Out-Null
-    } elseif (-not (Get-ScheduledTask -TaskName $newTaskName -ErrorAction SilentlyContinue)) {
-        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-        $trigs = @(
-            New-ScheduledTaskTrigger -Daily -At 7am,
-            New-ScheduledTaskTrigger -Daily -At 9am,
-            New-ScheduledTaskTrigger -Daily -At 11am,
-            New-ScheduledTaskTrigger -Daily -At 1pm,
-            New-ScheduledTaskTrigger -Daily -At 3pm,
-            New-ScheduledTaskTrigger -Daily -At 5pm
-        )
-        Register-ScheduledTask -TaskName $newTaskName -Action $taskAction -Trigger $trigs -Principal $principal | Out-Null
-    } else {
-        Set-ScheduledTask -TaskName $newTaskName -Action $taskAction -ErrorAction SilentlyContinue | Out-Null
+    # Route the helper's progress messages into the log as indented detail lines.
+    $logToFile = {
+        param($Message)
+        Write-Log $Message 'DETAIL'
     }
-
-    # Ensure desired additional times exist (idempotent)
-    $desiredTimes = @("07:00", "09:00", "11:00", "13:00", "15:00", "17:00")
-    $existingTask = Get-ScheduledTask -TaskName $newTaskName -ErrorAction Stop
-    $existingTimes = $existingTask.Triggers | ForEach-Object {
-        try { ([DateTime]::Parse($_.StartBoundary)).ToString("HH:mm") } catch { $null }
-    } | Where-Object { $_ }
-
-    $missingTimes = $desiredTimes | Where-Object { $_ -notin $existingTimes }
-    if ($missingTimes.Count -gt 0) {
-        $newTriggers = @($existingTask.Triggers)
-        foreach ($time in $missingTimes) {
-            $dt = [datetime]::ParseExact($time, "HH:mm", $null)
-            $newTriggers += New-ScheduledTaskTrigger -Daily -At $dt
-        }
-        Set-ScheduledTask -TaskName $newTaskName -Trigger $newTriggers
-    }
+    Ensure-CorinaStagingUpdaterTask -Instance $corinaRegistryInstance -TaskName $newTaskName -LegacyTaskNames $taskNamesToRemove -Log $logToFile
+    Write-Log "scheduled task '$newTaskName' verified" 'OK'
 }
 catch {
-    "[$(Get-Date)]  Scheduled task migration/ensure failed: $_" | Out-File -Append $logPath
+    Write-Log "scheduled task migration/ensure failed: $_" 'WARN'
 }
+
+if ($script:updateFailed) {
+    Write-Log "RESULT: update did not complete; exiting with code 1 so the scheduled task records the failure" 'FAIL'
+    exit 1
+}
+Write-Log "RESULT: updater run finished" 'OK'

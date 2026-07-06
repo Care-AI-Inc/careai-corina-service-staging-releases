@@ -18,6 +18,17 @@ if (-not ([Security.Principal.WindowsPrincipal] `
 
 Write-Host "[*] Running as Administrator"
 
+# Force TLS 1.2 (required for GitHub; old .NET/PS 5.1 defaults to TLS 1.0)
+try {
+    $proto = [System.Net.ServicePointManager]::SecurityProtocol
+    $tls12 = [System.Net.SecurityProtocolType]::Tls12
+    if (($proto -band $tls12) -eq 0) {
+        [System.Net.ServicePointManager]::SecurityProtocol = $proto -bor $tls12
+    }
+} catch {
+    Write-Warning "Failed to enable TLS 1.2: $_"
+}
+
 Write-Host "`n[*] Configuring staging environment"
 [Environment]::SetEnvironmentVariable("DOTNET_ENVIRONMENT", "Staging", [System.EnvironmentVariableTarget]::Machine)
 Write-Host "    -> Set machine environment variable DOTNET_ENVIRONMENT=Staging"

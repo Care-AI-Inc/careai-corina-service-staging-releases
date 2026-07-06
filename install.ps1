@@ -27,6 +27,19 @@ if (-not ([Security.Principal.WindowsPrincipal] `
 Write-Host "[*] Running as Administrator (Corina Service - Staging)"
 
 # =========================
+# Force TLS 1.2 (required for GitHub; old .NET/PS 5.1 defaults to TLS 1.0)
+# =========================
+try {
+    $proto = [System.Net.ServicePointManager]::SecurityProtocol
+    $tls12 = [System.Net.SecurityProtocolType]::Tls12
+    if (($proto -band $tls12) -eq 0) {
+        [System.Net.ServicePointManager]::SecurityProtocol = $proto -bor $tls12
+    }
+} catch {
+    Write-Warning "Failed to enable TLS 1.2: $_"
+}
+
+# =========================
 # Multi-instance bootstrap
 # =========================
 function Get-CorinaRegistryInstance {
@@ -96,7 +109,7 @@ $apiUrl = "https://api.github.com/repos/$repo/releases/latest"
 $headers = @{ "User-Agent" = "CorinaServiceInstaller - Staging" }
 
 try {
-    $response = Invoke-RestMethod -Uri $apiUrl -Headers $headers
+    $response = Invoke-RestMethod -Uri $apiUrl -Headers $headers -TimeoutSec 30
     $zipAsset = $response.assets | Where-Object { $_.name -like '*.zip' } | Select-Object -First 1
     if (-not $zipAsset) { throw "No .zip asset found in latest release." }
     $zipUrl  = $zipAsset.browser_download_url
@@ -109,7 +122,7 @@ try {
 Write-Host "    -> Downloading $zipName from $zipUrl"
 $zipPath    = Join-Path $env:TEMP $zipName
 try {
-    Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath
+    Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 300
 } catch {
     Write-Error "Failed to download ${zipName}: $_"
     exit 1
@@ -249,139 +262,29 @@ Write-Host "SUCCESS: Corina Service (Staging) installed and started."
 # Scheduled Task: remove old, create new
 # =========================
 Write-Host "`n[*] Configuring daily auto-updater"
-$scriptDir = "C:\Scripts"
-if ($corinaRegistryInstance) {
-    $shimPath = Join-Path $scriptDir "run-daily-updater-staging-$corinaRegistryInstance.ps1"
-    $legacyShimPath = Join-Path $scriptDir "run-daily-updater-staging.ps1"
-    $legacyTaskName = "CorinaStagingDailyUpdater"
-} else {
-    $shimPath = Join-Path $scriptDir "run-daily-updater-staging.ps1"
-    $legacyShimPath = $null
-    $legacyTaskName = $null
-}
 
-if (-not (Test-Path $scriptDir)) { New-Item -ItemType Directory -Path $scriptDir | Out-Null }
-Write-Host "    -> Updater script directory: $scriptDir"
-
-# =========================
-# Instance installs must not leave the old single-instance updater running in parallel.
-# =========================
-if ($legacyTaskName -and (Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue)) {
-    Write-Host "    -> Removing legacy scheduled task: $legacyTaskName"
-    Unregister-ScheduledTask -TaskName $legacyTaskName -Confirm:$false
-    Start-Sleep -Seconds 1
-}
-if ($legacyShimPath -and (Test-Path $legacyShimPath)) {
-    Write-Host "    -> Removing legacy updater shim: $legacyShimPath"
-    Remove-Item -LiteralPath $legacyShimPath -Force -ErrorAction SilentlyContinue
-}
-
-# =========================
-# Write shim script that always fetches latest updater.
-# Instance/env are written into the shim so manual runs behave like the scheduled task.
-# =========================
-$shimPrefix = "`$env:DOTNET_ENVIRONMENT = 'Staging'`r`n"
-if ($corinaRegistryInstance) {
-    $shimPrefix = "`$env:CorinaRegistryInstance = '$corinaRegistryInstance'`r`n$shimPrefix"
-}
-Write-Host "    -> Writing updater shim: $shimPath"
-$shimContent = @'
-# run-daily-updater-staging.ps1
-# Safer and more reliable version with TLS 1.2, retry logic, and logging.
-
-$ErrorActionPreference = 'Stop'
-$_inst   = $env:CorinaRegistryInstance
-$LogPath = if ($_inst) { "C:\Scripts\samantha-update-log-$_inst.txt" } else { 'C:\Scripts\samantha-update-log.txt' }
-$Url     = 'https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-staging-releases/main/daily-updater.ps1'
-
-# 1) Force TLS 1.2 (required for GitHub)
+# Ensure-CorinaStagingUpdaterTask lives in a shared script (also used by daily-updater.ps1).
+# This script runs via `irm | iex` on clinic machines, so the helper must be fetched
+# from the release repo rather than dot-sourced from disk.
+$ensureTaskUrl = "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-staging-releases/main/ensure-updater-task.ps1"
 try {
-    $proto = [System.Net.ServicePointManager]::SecurityProtocol
-    $tls12 = [System.Net.SecurityProtocolType]::Tls12
-    if (($proto -band $tls12) -eq 0) {
-        [System.Net.ServicePointManager]::SecurityProtocol = $proto -bor $tls12
-    }
+    Invoke-RestMethod -Uri $ensureTaskUrl -Headers $headers -TimeoutSec 30 | Invoke-Expression
 } catch {
-    "`n[$(Get-Date)] Failed to enable TLS 1.2: $_" | Out-File -Append $LogPath
-}
-
-# 2) Simple retry helper
-function Invoke-WithRetry {
-    param(
-        [scriptblock]$Action,
-        [int]$MaxRetries = 3,
-        [int]$DelaySec   = 5
-    )
-    $attempt = 0
-    while ($true) {
-        try {
-            $attempt++
-            return & $Action
-        } catch {
-            if ($attempt -ge $MaxRetries) { throw }
-            Start-Sleep -Seconds $DelaySec
-        }
-    }
-}
-
-# 3) Download, save, and run
-try {
-    $Headers = @{ 'User-Agent' = 'PowerShell/5.1 CareAI-Updater' }
-    $safeInst = if ($_inst) { $_inst } else { 'default' }
-    $TmpFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "daily-updater-staging-$safeInst.ps1")
-
-    $content = Invoke-WithRetry {
-        (Invoke-WebRequest -Uri $Url -Headers $Headers -UseBasicParsing -TimeoutSec 30).Content
-    }
-
-    if ([string]::IsNullOrWhiteSpace($content)) {
-        throw "Downloaded content is empty."
-    }
-    if ($content.Length -gt 0 -and $content[0] -eq [char]0xFEFF) {
-        $content = $content.Substring(1)
-    }
-
-    $content | Set-Content -LiteralPath $TmpFile -Encoding UTF8
-
-    # Run the downloaded script in a new process
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $TmpFile
-}
-catch {
-    "`n[$(Get-Date)] Failed to fetch and run latest staging updater: $_" | Out-File -Append $LogPath
+    Write-Error "Failed to fetch shared updater-task helper from ${ensureTaskUrl}: $_"
     exit 1
 }
-'@
-($shimPrefix + $shimContent) | Set-Content -Path $shimPath -Encoding UTF8
 
-# =========================
-# Define action/principal/triggers
-# =========================
+# Tagged installs must not leave the old single-instance task/shim running in parallel.
+$legacyTaskNames = @()
+$legacyShimPaths = @()
 if ($corinaRegistryInstance) {
-    $taskArgument = "-NoProfile -ExecutionPolicy Bypass -Command `"`$env:CorinaRegistryInstance='$corinaRegistryInstance'; `$env:DOTNET_ENVIRONMENT='Staging'; & '$shimPath'`""
-} else {
-    $taskArgument = "-NoProfile -ExecutionPolicy Bypass -File `"$shimPath`""
+    $legacyTaskNames += "CorinaStagingDailyUpdater"
+    $legacyShimPaths += Join-Path "C:\Scripts" "run-daily-updater-staging.ps1"
 }
-$action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $taskArgument
-$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-$trigger1  = New-ScheduledTaskTrigger -Daily -At 7am
-$trigger2  = New-ScheduledTaskTrigger -Daily -At 9am
-$trigger3  = New-ScheduledTaskTrigger -Daily -At 11am
-$trigger4  = New-ScheduledTaskTrigger -Daily -At 1pm
-$trigger5  = New-ScheduledTaskTrigger -Daily -At 3pm
-$trigger6  = New-ScheduledTaskTrigger -Daily -At 5pm
-$trigger7  = New-ScheduledTaskTrigger -Daily -At 12am
+Ensure-CorinaStagingUpdaterTask -Instance $corinaRegistryInstance -TaskName $taskName -LegacyTaskNames $legacyTaskNames -LegacyShimPaths $legacyShimPaths -ForceRecreate
 
-# =========================
-# Delete existing new-named task if present (idempotent create)
-# =========================
-if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
-    Write-Host "    -> Replacing existing scheduled task: $taskName"
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
-    Start-Sleep -Seconds 1
-}
-
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger1, $trigger2, $trigger3, $trigger4, $trigger5, $trigger6, $trigger7 -Principal $principal | Out-Null
-Write-Host "    -> Scheduled task '$taskName' created with 7 daily triggers."
+# Clean up the downloaded zip now that the install has fully succeeded
+Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
 
 Write-Host "`nSUCCESS: Corina Service (Staging) install complete."
 
