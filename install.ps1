@@ -281,9 +281,13 @@ try {
 }
 
 # Tagged installs must not leave the old single-instance task/shim running in parallel.
+# Exception: while a default (no-tag) service is still installed on this machine, its
+# updater task/shim are legitimately in use (staging test boxes run tagged and no-tag
+# side by side), so only clean them up once the default service itself is gone.
 $legacyTaskNames = @()
 $legacyShimPaths = @()
-if ($corinaRegistryInstance) {
+$defaultServiceInstalled = [bool](Get-Service -Name "CorinaService-Staging" -ErrorAction SilentlyContinue)
+if ($corinaRegistryInstance -and -not $defaultServiceInstalled) {
     $legacyTaskNames += "CorinaStagingDailyUpdater"
     $legacyShimPaths += Join-Path "C:\Scripts" "run-daily-updater-staging.ps1"
 }
