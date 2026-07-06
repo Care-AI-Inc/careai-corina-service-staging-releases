@@ -481,19 +481,27 @@ finally {
 try {
     Write-Log "Refresh updater shim and scheduled task" 'STEP'
     $ensureTaskUrl = "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-staging-releases/main/ensure-updater-task.ps1"
-    Invoke-RestMethod -Uri $ensureTaskUrl -Headers $headers -TimeoutSec 30 | Invoke-Expression
+    $ensureTaskContent = Invoke-RestMethod -Uri $ensureTaskUrl -Headers $headers -TimeoutSec 30
+    # Strip a UTF-8 BOM if present: Invoke-RestMethod keeps it as a leading U+FEFF
+    # character, which breaks Invoke-Expression parsing.
+    if ($ensureTaskContent.Length -gt 0 -and $ensureTaskContent[0] -eq [char]0xFEFF) {
+        $ensureTaskContent = $ensureTaskContent.Substring(1)
+    }
+    Invoke-Expression $ensureTaskContent
 
-    # Tagged installs must not leave the old single-instance task running in parallel.
+    # Tagged installs must not leave the old single-instance task/shim running in parallel.
     $taskNamesToRemove = @()
+    $shimPathsToRemove = @()
     if ($corinaRegistryInstance) {
         $taskNamesToRemove += "CorinaStagingDailyUpdater"
+        $shimPathsToRemove += Join-Path "C:\Scripts" "run-daily-updater-staging.ps1"
     }
     # Route the helper's progress messages into the log as indented detail lines.
     $logToFile = {
         param($Message)
         Write-Log $Message 'DETAIL'
     }
-    Ensure-CorinaStagingUpdaterTask -Instance $corinaRegistryInstance -TaskName $newTaskName -LegacyTaskNames $taskNamesToRemove -Log $logToFile
+    Ensure-CorinaStagingUpdaterTask -Instance $corinaRegistryInstance -TaskName $newTaskName -LegacyTaskNames $taskNamesToRemove -LegacyShimPaths $shimPathsToRemove -Log $logToFile
     Write-Log "scheduled task '$newTaskName' verified" 'OK'
 }
 catch {

@@ -85,7 +85,13 @@ $corinaStagingInstallSucceeded = $false
 $previousCorinaInstallerOutputIndent = $env:CorinaInstallerOutputIndent
 $env:CorinaInstallerOutputIndent = "    "
 try {
-    irm https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-staging-releases/main/install.ps1 | iex
+    $installerContent = irm https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-staging-releases/main/install.ps1
+    # Strip a UTF-8 BOM if present: Invoke-RestMethod keeps it as a leading U+FEFF
+    # character, which breaks Invoke-Expression parsing.
+    if ($installerContent.Length -gt 0 -and $installerContent[0] -eq [char]0xFEFF) {
+        $installerContent = $installerContent.Substring(1)
+    }
+    Invoke-Expression $installerContent
 } finally {
     if ($null -eq $previousCorinaInstallerOutputIndent) {
         Remove-Item Env:\CorinaInstallerOutputIndent -ErrorAction SilentlyContinue

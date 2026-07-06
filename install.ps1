@@ -268,7 +268,13 @@ Write-Host "`n[*] Configuring daily auto-updater"
 # from the release repo rather than dot-sourced from disk.
 $ensureTaskUrl = "https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-staging-releases/main/ensure-updater-task.ps1"
 try {
-    Invoke-RestMethod -Uri $ensureTaskUrl -Headers $headers -TimeoutSec 30 | Invoke-Expression
+    $ensureTaskContent = Invoke-RestMethod -Uri $ensureTaskUrl -Headers $headers -TimeoutSec 30
+    # Strip a UTF-8 BOM if present: Invoke-RestMethod keeps it as a leading U+FEFF
+    # character, which breaks Invoke-Expression parsing.
+    if ($ensureTaskContent.Length -gt 0 -and $ensureTaskContent[0] -eq [char]0xFEFF) {
+        $ensureTaskContent = $ensureTaskContent.Substring(1)
+    }
+    Invoke-Expression $ensureTaskContent
 } catch {
     Write-Error "Failed to fetch shared updater-task helper from ${ensureTaskUrl}: $_"
     exit 1
