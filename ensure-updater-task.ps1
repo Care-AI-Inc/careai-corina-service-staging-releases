@@ -217,7 +217,11 @@ exit 0
     }
     $taskAction   = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $taskArgument
     $principal    = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-    $settings     = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew
+    # ExecutionTimeLimit: a run wedged behind AV file locks (or a hung download) gets
+    # killed by Task Scheduler after 100 minutes -- comfortably before the next trigger
+    # (triggers are at least 2h apart), so a wedged run never eats into the next window;
+    # the next trigger recovers via the abandoned-mutex path in daily-updater.ps1.
+    $settings     = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 100)
     $desiredTimes = @("00:00", "07:00", "09:00", "11:00", "13:00", "15:00", "17:00")
 
     $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue

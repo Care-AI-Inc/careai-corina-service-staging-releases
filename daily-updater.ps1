@@ -142,6 +142,17 @@ if (-not $mutexAcquired) {
 # report the failure instead of always showing success.
 $script:updateFailed = $false
 
+# Crash/watchdog post-mortem marker: written now, removed just before the RESULT
+# lines at the end. A kill (task ExecutionTimeLimit, process/machine death) skips
+# the removal, so finding the marker here means the PREVIOUS run never finished.
+$inflightMarker = if ($corinaRegistryInstance) { Join-Path $logDir "corina-staging-updater-inflight-$corinaRegistryInstance.marker" } else { Join-Path $logDir "corina-staging-updater-inflight.marker" }
+if (Test-Path $inflightMarker) {
+    $prevStart = ''
+    try { $prevStart = [string](Get-Content -LiteralPath $inflightMarker -TotalCount 1 -ErrorAction Stop) } catch { }
+    Write-Log "previous updater run (started $prevStart) never finished -- likely killed by the 100-minute task watchdog or an unexpected process/machine termination" 'WARN'
+}
+"$(Get-Date)" | Out-File -LiteralPath $inflightMarker
+
 # =========================
 # Download diagnostics helpers (log-only; used to explain download failures on
 # locked-down clinic networks: proxy, DNS, TLS interception, blocked CDN, AV locks)
@@ -345,18 +356,136 @@ function Get-DnsInfo([string]$UriString) {
     }
 }
 
+function Format-DownloadBytes([long]$Bytes) {
+    if ($Bytes -ge 1GB) { return ("{0:N2} GB" -f ($Bytes / 1GB)) }
+    if ($Bytes -ge 1MB) { return ("{0:N2} MB" -f ($Bytes / 1MB)) }
+    if ($Bytes -ge 1KB) { return ("{0:N2} KB" -f ($Bytes / 1KB)) }
+    return "$Bytes bytes"
+}
+
+function Test-DownloadTimeoutException([Exception]$ex) {
+    $text = Get-ExceptionText $ex
+    return ($text -match '(?i)timed?\s*out|timeout|operation has timed out|the request was aborted')
+}
+
+function Invoke-TimedWebDownload {
+    param(
+        [Parameter(Mandatory=$true)][string]$Uri,
+        [hashtable]$Headers,
+        [Parameter(Mandatory=$true)][string]$OutFile,
+        [int]$TimeoutSec = 300
+    )
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    Write-Log ("[DOWNLOAD] Invoke-WebRequest starting (timeout={0}s) -> {1}" -f $TimeoutSec, $Uri)
+    try {
+        Invoke-WebRequest -Uri $Uri -Headers $Headers -OutFile $OutFile -UseBasicParsing -TimeoutSec $TimeoutSec | Out-Null
+        $sw.Stop()
+        $size = 0L
+        if (Test-Path -LiteralPath $OutFile) { $size = (Get-Item -LiteralPath $OutFile).Length }
+        Write-Log ("[DOWNLOAD] Invoke-WebRequest completed in {0:N1}s ({1})" -f $sw.Elapsed.TotalSeconds, (Format-DownloadBytes $size))
+        return $true
+    } catch {
+        $sw.Stop()
+        $exText = Get-ExceptionText $_.Exception
+        if (Test-DownloadTimeoutException $_.Exception) {
+            Write-Log ("[DOWNLOAD] Invoke-WebRequest TIMED OUT after {0:N1}s (limit={1}s)" -f $sw.Elapsed.TotalSeconds, $TimeoutSec)
+        } else {
+            Write-Log ("[DOWNLOAD] Invoke-WebRequest failed after {0:N1}s: {1}" -f $sw.Elapsed.TotalSeconds, $exText)
+        }
+        throw
+    }
+}
+
 function Invoke-BitsDownload {
     param(
         [Parameter(Mandatory=$true)][string]$Source,
-        [Parameter(Mandatory=$true)][string]$Destination
+        [Parameter(Mandatory=$true)][string]$Destination,
+        [int]$ProgressIntervalSec = 60
     )
+    $bitsTimeoutSec = 0
+    if (-not [string]::IsNullOrWhiteSpace($env:CORINA_DOWNLOAD_TIMEOUT_SEC)) {
+        [int]::TryParse($env:CORINA_DOWNLOAD_TIMEOUT_SEC, [ref]$bitsTimeoutSec) | Out-Null
+    }
+    $timeoutLabel = if ($bitsTimeoutSec -gt 0) { "${bitsTimeoutSec}s" } else { "none (set CORINA_DOWNLOAD_TIMEOUT_SEC to cap)" }
+
     try {
-        if (-not (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue)) { return $false }
-        Write-Log "trying BITS download..."
-        Start-BitsTransfer -Source $Source -Destination $Destination -ErrorAction Stop
-        return $true
+        if (-not (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue)) {
+            Write-Log "[DOWNLOAD] BITS unavailable on this host."
+            return $false
+        }
+
+        if (Test-Path -LiteralPath $Destination) {
+            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+        }
+
+        Write-Log ("[DOWNLOAD] BITS transfer starting (timeout={0}, progress every {1}s) -> {2}" -f $timeoutLabel, $ProgressIntervalSec, $Source)
+        $bitsJob = Start-BitsTransfer -Source $Source -Destination $Destination -Asynchronous -ErrorAction Stop
+
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $lastProgressLogSec = -1
+        while ($true) {
+            $bits = Get-BitsTransfer -Id $bitsJob.JobId -ErrorAction SilentlyContinue
+            if (-not $bits) {
+                if (Test-Path -LiteralPath $Destination) {
+                    $sw.Stop()
+                    $size = (Get-Item -LiteralPath $Destination).Length
+                    Write-Log ("[DOWNLOAD] BITS completed in {0:N1}s ({1})" -f $sw.Elapsed.TotalSeconds, (Format-DownloadBytes $size))
+                    return $true
+                }
+                Write-Log "[DOWNLOAD] BITS job ended without output file."
+                return $false
+            }
+
+            $elapsedSec = [int]$sw.Elapsed.TotalSeconds
+            $state = [string]$bits.JobState
+            $transferred = [long]$bits.BytesTransferred
+            $total = [long]$bits.BytesTotal
+            $pct = if ($total -gt 0) { [math]::Round(100.0 * $transferred / $total, 1) } else { 0 }
+
+            if ($state -in @('Transferred', 'Acknowledged')) {
+                try { Complete-BitsTransfer -BitsJob $bits -ErrorAction Stop } catch { }
+                $sw.Stop()
+                $size = if (Test-Path -LiteralPath $Destination) { (Get-Item -LiteralPath $Destination).Length } else { $transferred }
+                Write-Log ("[DOWNLOAD] BITS completed in {0:N1}s ({1}, state={2})" -f $sw.Elapsed.TotalSeconds, (Format-DownloadBytes $size), $state)
+                return $true
+            }
+
+            if ($state -eq 'Error') {
+                $sw.Stop()
+                Write-Log ("[DOWNLOAD] BITS failed after {0:N1}s (state=Error, transferred={1}/{2}): {3}" -f `
+                    $sw.Elapsed.TotalSeconds, (Format-DownloadBytes $transferred), (Format-DownloadBytes $total), $bits.ErrorDescription)
+                try { Remove-BitsTransfer -BitsJob $bits -ErrorAction SilentlyContinue } catch { }
+                return $false
+            }
+
+            if ($state -eq 'Cancelled') {
+                $sw.Stop()
+                Write-Log ("[DOWNLOAD] BITS cancelled after {0:N1}s (transferred={1}/{2})" -f `
+                    $sw.Elapsed.TotalSeconds, (Format-DownloadBytes $transferred), (Format-DownloadBytes $total))
+                return $false
+            }
+
+            if ($bitsTimeoutSec -gt 0 -and $elapsedSec -ge $bitsTimeoutSec) {
+                $sw.Stop()
+                Write-Log ("[DOWNLOAD] BITS TIMED OUT after {0:N1}s (limit={1}s, transferred={2}/{3}, state={4})" -f `
+                    $sw.Elapsed.TotalSeconds, $bitsTimeoutSec, (Format-DownloadBytes $transferred), (Format-DownloadBytes $total), $state)
+                try { Remove-BitsTransfer -BitsJob $bits -ErrorAction SilentlyContinue } catch { }
+                if (Test-Path -LiteralPath $Destination) {
+                    Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+                }
+                return $false
+            }
+
+            if ($elapsedSec -ge $ProgressIntervalSec -and ($elapsedSec - $lastProgressLogSec) -ge $ProgressIntervalSec) {
+                $lastProgressLogSec = $elapsedSec
+                Write-Log ("[DOWNLOAD] BITS progress: {0}/{1} ({2}%) elapsed={3}s state={4}" -f `
+                    (Format-DownloadBytes $transferred), (Format-DownloadBytes $total), $pct, $elapsedSec, $state)
+            }
+
+            Start-Sleep -Seconds 5
+        }
     } catch {
-        Write-Log ("BITS download failed: " + (Get-ExceptionText $_.Exception)) 'WARN'
+        Write-Log ("[DOWNLOAD] BITS download failed: " + (Get-ExceptionText $_.Exception))
         return $false
     }
 }
@@ -570,14 +699,30 @@ try {
         Write-Log "Defender not available or inactive; skipping exclusion"
     }
 
-    # =========================
-    # Download (with diagnostics and BITS fallback for locked-down networks)
-    # =========================
+    # Download and extract
     try {
-        Write-Log "download URL: $zipUrl"
+        Write-Log "[DOWNLOAD] Downloading release asset: $zipName"
+        Write-Log "[INFO] Download URL: $zipUrl"
         Write-Log (Get-ProxyInfo $zipUrl)
-        Write-Log ("RevocationCheckEnabled: $([System.Net.ServicePointManager]::CheckCertificateRevocationList)")
-        Write-Log (Get-DnsInfo $zipUrl)
+        Write-Log ("[INFO] RevocationCheckEnabled: $([System.Net.ServicePointManager]::CheckCertificateRevocationList)")
+        Write-Log ("[INFO] " + (Get-DnsInfo $zipUrl))
+
+        if ($zipAssetApiUrl) {
+            Write-Log "[INFO] Asset API URL: $zipAssetApiUrl"
+            $apiRedirect = Get-RedirectLocationFromGitHubAssetApi -AssetApiUrl $zipAssetApiUrl -Headers $headers
+            if ($apiRedirect.Error) { Write-Log ("[INFO] Asset API redirect probe error: " + $apiRedirect.Error) }
+            if ($apiRedirect.Status) { Write-Log ("[INFO] Asset API status: " + $apiRedirect.Status) }
+            if ($apiRedirect.Location) {
+                Write-Log "[INFO] Asset API Redirect Location: $($apiRedirect.Location)"
+                Write-Log (Get-ProxyInfo $apiRedirect.Location)
+                Write-Log ("[INFO] " + (Get-DnsInfo $apiRedirect.Location))
+                Write-Log ("[INFO] " + (Get-TlsProbeInfo $apiRedirect.Location))
+            } else {
+                Write-Log "[INFO] Asset API Redirect Location: <none detected>"
+            }
+        } else {
+            $apiRedirect = $null
+        }
 
         $redirect = Get-RedirectLocation -Uri $zipUrl -Headers $headers
         if ($redirect) {
@@ -585,6 +730,18 @@ try {
         } else {
             Write-Log "redirect location: <none detected>"
         }
+
+        if ($redirect) {
+            $downloadUrl = $redirect
+            $downloadUrlSource = 'browser-redirect'
+        } elseif ($apiRedirect -and $apiRedirect.Location) {
+            $downloadUrl = $apiRedirect.Location
+            $downloadUrlSource = 'asset-api-redirect'
+        } else {
+            $downloadUrl = $zipUrl
+            $downloadUrlSource = 'browser-url'
+        }
+        Write-Log "[INFO] Selected download URL source: $downloadUrlSource"
 
         # If CRL/OCSP is blocked on the network, Schannel revocation check can fail with a generic trust error.
         # Allow an opt-out for diagnostics only.
@@ -594,32 +751,30 @@ try {
             Write-Log "CORINA_DISABLE_CRL=1 enabled. Disabling certificate revocation checks for this download." 'WARN'
             [System.Net.ServicePointManager]::CheckCertificateRevocationList = $false
         }
+        $iwrTimeoutSec = 300
+        if (-not [string]::IsNullOrWhiteSpace($env:CORINA_IWR_TIMEOUT_SEC)) {
+            [int]::TryParse($env:CORINA_IWR_TIMEOUT_SEC, [ref]$iwrTimeoutSec) | Out-Null
+        }
         try {
-            # Download the final asset URL directly when a redirect is known; this also
-            # avoids any difference in redirect handling.
-            $downloadUri = if ($redirect) { $redirect } else { $zipUrl }
-            $p = @{
-                Uri             = $downloadUri
-                Headers         = $headers
-                OutFile         = $tempZip
-                UseBasicParsing = $true
-                TimeoutSec      = 300
-            }
+            $downloaded = $false
             try {
-                Invoke-WebRequest @p | Out-Null
+                Invoke-TimedWebDownload -Uri $downloadUrl -Headers $headers -OutFile $tempZip -TimeoutSec $iwrTimeoutSec | Out-Null
+                $downloaded = $true
             } catch {
-                # Fallback to BITS (different network stack)
-                if (-not (Invoke-BitsDownload -Source $downloadUri -Destination $tempZip)) { throw }
+                Write-Log "[DOWNLOAD] Falling back to BITS after Invoke-WebRequest failure."
+                if (-not (Invoke-BitsDownload -Source $downloadUrl -Destination $tempZip)) { throw }
+                $downloaded = $true
             }
+            if (-not $downloaded) { throw "Download did not complete." }
         } finally {
             if ($disableCrl) { [System.Net.ServicePointManager]::CheckCertificateRevocationList = $oldCrl }
         }
         Write-Log "downloaded to $tempZip"
     } catch {
-        # Deep diagnostics only on failure, so the success path stays quiet.
-        Write-Log "download failed for: $zipUrl" 'FAIL'
-        Write-Log "SecurityProtocol: $([System.Net.ServicePointManager]::SecurityProtocol)"
-        Write-Log (Get-ProxyInfo $zipUrl)
+        Write-Log "[ERROR] Download failed for: $zipUrl"
+        if ($downloadUrl) { Write-Log "[INFO] Attempted download URL ($downloadUrlSource): $downloadUrl" }
+        Write-Log "[INFO] SecurityProtocol: $([System.Net.ServicePointManager]::SecurityProtocol)"
+        Write-Log "[INFO] $((Get-ProxyInfo $zipUrl))"
         $dbg = Get-ResponseDebugInfo $_.Exception
         if ($dbg) { Write-Log $dbg }
         Write-Log ("RevocationCheckEnabled: $([System.Net.ServicePointManager]::CheckCertificateRevocationList)")
@@ -650,6 +805,8 @@ try {
     # Wait for AV to release the ZIP, then expand with retries
     if (-not (Wait-FileReadable $tempZip 120)) { throw "Downloaded ZIP locked too long: $tempZip" }
     if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
+    Write-Log "extracting archive to $extractDir..."
+    $expandSw = [Diagnostics.Stopwatch]::StartNew()
     $expandAttempt = 0
     while ($true) {
         try {
@@ -657,18 +814,36 @@ try {
             break
         } catch {
             $expandAttempt++
+            Write-Log "extract attempt $expandAttempt failed: $($_.Exception.Message)" 'WARN'
             if ($expandAttempt -ge 5) { throw }
             Start-Sleep -Seconds 2
         }
     }
+    Write-Log "extracted in $([int]$expandSw.Elapsed.TotalSeconds)s"
     # Unblock extracted files to reduce SmartScreen/AV processing
     try { Get-ChildItem -Path $extractDir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch { }
 
-    # Wait until extracted files are readable (handle AV scans)
-    Get-ChildItem -Path $extractDir -Recurse -File | ForEach-Object {
-        if (-not (Wait-FileReadable $_.FullName 300)) {
-            Write-Log "source not readable after wait (continuing): $($_.FullName)" 'WARN'
+    # Wait until extracted files are readable (handle AV scans). Bounded by a GLOBAL
+    # budget: the deploy robocopy below retries locked files itself (/R:10 /W:5), so
+    # this wait is only a first line of defense and must never stall the update for
+    # hours the way a per-file timeout can on a machine whose AV holds locks broadly.
+    $avWaitBudgetSec = 600
+    $avSw = [Diagnostics.Stopwatch]::StartNew()
+    $extractedFiles = @(Get-ChildItem -Path $extractDir -Recurse -File)
+    Write-Log "waiting for AV to release $($extractedFiles.Count) extracted files (global budget ${avWaitBudgetSec}s)..."
+    $lockedCount = 0
+    foreach ($f in $extractedFiles) {
+        $remainingSec = $avWaitBudgetSec - [int]$avSw.Elapsed.TotalSeconds
+        if ($remainingSec -le 0) { $lockedCount++; continue }
+        if (-not (Wait-FileReadable $f.FullName ([Math]::Min(60, $remainingSec)))) {
+            $lockedCount++
+            Write-Log "still locked after wait (continuing): $($f.FullName)" 'WARN'
         }
+    }
+    if ($lockedCount -gt 0) {
+        Write-Log "$lockedCount file(s) still locked after $([int]$avSw.Elapsed.TotalSeconds)s; relying on robocopy retries" 'WARN'
+    } else {
+        Write-Log "all $($extractedFiles.Count) extracted files readable after $([int]$avSw.Elapsed.TotalSeconds)s"
     }
 
     # =========================
@@ -902,6 +1077,10 @@ try {
 catch {
     Write-Log "scheduled task migration/ensure failed: $_" 'WARN'
 }
+
+# This run reached its natural end (success or handled failure); clear the
+# post-mortem marker so the next run does not report a phantom kill.
+Remove-Item -LiteralPath $inflightMarker -Force -ErrorAction SilentlyContinue
 
 if ($script:updateFailed) {
     Write-Log "RESULT: update did not complete; exiting with code 1 so the scheduled task records the failure" 'FAIL'
