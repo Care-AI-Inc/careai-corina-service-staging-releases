@@ -750,7 +750,7 @@ try {
     # =========================
     # Copy extracted files  new install folder (preserve ACLs)
     # =========================
-    robocopy $extractDir $installDir /E /R:2 /W:2 /NFL /NDL /NP /NJH /NJS | Out-Null
+    & robocopy "$extractDir" "$installDir" * /E /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
     $rc2 = $LASTEXITCODE
     if ($rc2 -ge 8) {
         if ($haveBackup) {
