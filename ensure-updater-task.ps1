@@ -211,7 +211,10 @@ exit 0
     ($shimPrefix + $shimContent) | Set-Content -Path $shimPath -Encoding UTF8
 
     if ($Instance) {
-        $taskArgument = "-NoProfile -ExecutionPolicy Bypass -Command `"`$env:CorinaRegistryInstance='$Instance'; `$env:DOTNET_ENVIRONMENT='Staging'; & '$shimPath'`""
+        # 'exit $LASTEXITCODE' is required: in -Command mode, 'exit N' inside the shim
+        # only ends the shim script, and powershell.exe would report 0/1 instead of the
+        # shim's real exit code -- Task Scheduler would then show failures as success.
+        $taskArgument = "-NoProfile -ExecutionPolicy Bypass -Command `"`$env:CorinaRegistryInstance='$Instance'; `$env:DOTNET_ENVIRONMENT='Staging'; & '$shimPath'; exit `$LASTEXITCODE`""
     } else {
         $taskArgument = "-NoProfile -ExecutionPolicy Bypass -File `"$shimPath`""
     }
