@@ -143,6 +143,254 @@ if (-not $mutexAcquired) {
 $script:updateFailed = $false
 
 # =========================
+# Download diagnostics helpers (log-only; used to explain download failures on
+# locked-down clinic networks: proxy, DNS, TLS interception, blocked CDN, AV locks)
+# =========================
+function Get-ExceptionText([Exception]$ex) {
+    $parts = New-Object System.Collections.Generic.List[string]
+    $i = 0
+    while ($ex -and $i -lt 10) {
+        $parts.Add(("{0}: {1}" -f $ex.GetType().FullName, $ex.Message))
+        $ex = $ex.InnerException
+        $i++
+    }
+    return ($parts -join " | ")
+}
+
+function Get-ProxyInfo([string]$UriString) {
+    try {
+        $u = [Uri]$UriString
+        $p = [System.Net.WebRequest]::DefaultWebProxy
+        if (-not $p) { return "Proxy: <none>" }
+        $pu = $p.GetProxy($u)
+        if (-not $pu) { return "Proxy: <unknown>" }
+        # If GetProxy returns the original URI, it means "direct" (no proxy used)
+        if ($pu.AbsoluteUri -eq $u.AbsoluteUri) { return "Proxy: <direct>" }
+        return "Proxy: $($pu.AbsoluteUri)"
+    } catch {
+        return "Proxy: <error>"
+    }
+}
+
+function Get-RedirectLocation {
+    param(
+        [Parameter(Mandatory=$true)][string]$Uri,
+        [hashtable]$Headers
+    )
+    # Use .NET HttpClient with redirects disabled to reliably capture Location without ever following it.
+    $client = $null
+    $handler = $null
+    $req = $null
+    $resp = $null
+    try {
+        $handler = New-Object System.Net.Http.HttpClientHandler
+        $handler.AllowAutoRedirect = $false
+        $client = New-Object System.Net.Http.HttpClient($handler)
+        $client.Timeout = [TimeSpan]::FromSeconds(30)
+
+        $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $Uri)
+        if ($Headers) {
+            foreach ($k in $Headers.Keys) {
+                # Some headers are restricted; TryAddWithoutValidation avoids exceptions.
+                [void]$req.Headers.TryAddWithoutValidation($k, [string]$Headers[$k])
+            }
+        }
+
+        $resp = $client.SendAsync($req).GetAwaiter().GetResult()
+        $code = [int]$resp.StatusCode
+        if ($code -ge 300 -and $code -lt 400) {
+            $locUri = $resp.Headers.Location
+            if (-not $locUri) { return $null }
+            if (-not $locUri.IsAbsoluteUri) {
+                $base = [Uri]$Uri
+                $locUri = New-Object System.Uri($base, $locUri)
+            }
+            return $locUri.AbsoluteUri
+        }
+        return $null
+    } catch {
+        return $null
+    } finally {
+        if ($resp) { $resp.Dispose() }
+        if ($req) { $req.Dispose() }
+        if ($client) { $client.Dispose() }
+        if ($handler) { $handler.Dispose() }
+    }
+}
+
+function Get-ResponseDebugInfo {
+    param([Exception]$ex)
+    try {
+        $resp = $ex.Response
+        if (-not $resp) { return $null }
+        $status = $null
+        try { $status = ([int]$resp.StatusCode).ToString() + " " + $resp.StatusDescription } catch { }
+        $loc = $null
+        try { $loc = $resp.Headers['Location'] } catch { }
+        $server = $null
+        try { $server = $resp.Headers['Server'] } catch { }
+        return ("HTTP Response -> Status='{0}' Location='{1}' Server='{2}'" -f $status, $loc, $server)
+    } catch {
+        return $null
+    }
+}
+
+function Get-RedirectLocationFromGitHubAssetApi {
+    param(
+        [Parameter(Mandatory=$true)][string]$AssetApiUrl,
+        [hashtable]$Headers
+    )
+    # GitHub API asset download: GET .../releases/assets/{id} with Accept: application/octet-stream returns 302 Location
+    $req = $null
+    $resp = $null
+    try {
+        $req = [System.Net.HttpWebRequest]::Create($AssetApiUrl)
+        $req.Method = 'GET'
+        $req.AllowAutoRedirect = $false
+        $req.UserAgent = 'CorinaServiceStagingUpdater'
+        $req.Timeout = 30000
+        $req.ReadWriteTimeout = 30000
+        $req.Accept = 'application/octet-stream'
+        if ($Headers) {
+            foreach ($k in $Headers.Keys) {
+                try { $req.Headers[$k] = [string]$Headers[$k] } catch { }
+            }
+        }
+
+        try {
+            $resp = [System.Net.HttpWebResponse]$req.GetResponse()
+        } catch [System.Net.WebException] {
+            $resp = $_.Exception.Response
+        }
+
+        if (-not $resp) { return @{ Location = $null; Status = $null; Error = "No response" } }
+
+        $status = $null
+        try { $status = ([int]$resp.StatusCode).ToString() + " " + $resp.StatusDescription } catch { }
+        $loc = $resp.Headers['Location']
+        return @{ Location = $loc; Status = $status; Error = $null }
+    } catch {
+        return @{ Location = $null; Status = $null; Error = (Get-ExceptionText $_.Exception) }
+    } finally {
+        try { if ($resp) { $resp.Close(); $resp.Dispose() } } catch { }
+        try { if ($req) { $req.Abort() } } catch { }
+    }
+}
+
+function Get-TlsProbeInfo([string]$UriString) {
+    try {
+        $u = [Uri]$UriString
+        $tlsHost = $u.DnsSafeHost
+        $port = if ($u.Port -gt 0) { $u.Port } else { 443 }
+
+        $captured = @{
+            Subject       = $null
+            Issuer        = $null
+            Thumbprint    = $null
+            NotAfter      = $null
+            PolicyErrors  = $null
+            ChainStatuses = $null
+        }
+
+        $client = New-Object System.Net.Sockets.TcpClient
+        try {
+            $client.ReceiveTimeout = 7000
+            $client.SendTimeout = 7000
+            $client.Connect($tlsHost, $port)
+
+            $cb = {
+                param($sslSender, $cert, $chain, $sslPolicyErrors)
+                try {
+                    if ($cert) {
+                        $c2 = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($cert)
+                        $captured.Subject = $c2.Subject
+                        $captured.Issuer = $c2.Issuer
+                        $captured.Thumbprint = $c2.Thumbprint
+                        $captured.NotAfter = $c2.NotAfter.ToString('o')
+                    }
+                    $captured.PolicyErrors = $sslPolicyErrors.ToString()
+                    if ($chain -and $chain.ChainStatus) {
+                        $captured.ChainStatuses = ($chain.ChainStatus | ForEach-Object { $_.Status.ToString() + ":" + $_.StatusInformation.Trim() }) -join " || "
+                    }
+                } catch { }
+                return $true
+            }
+
+            $ssl = New-Object System.Net.Security.SslStream($client.GetStream(), $false, $cb)
+            try {
+                $ssl.AuthenticateAsClient($tlsHost)
+            } finally {
+                $ssl.Dispose()
+            }
+        } finally {
+            $client.Close()
+        }
+
+        return ("TLS Probe -> Subject='{0}' Issuer='{1}' NotAfter='{2}' Thumbprint='{3}' PolicyErrors='{4}' ChainStatuses='{5}'" -f `
+            $captured.Subject, $captured.Issuer, $captured.NotAfter, $captured.Thumbprint, $captured.PolicyErrors, $captured.ChainStatuses)
+    } catch {
+        return ("TLS Probe failed: {0}" -f (Get-ExceptionText $_.Exception))
+    }
+}
+
+function Get-DnsInfo([string]$UriString) {
+    try {
+        $u = [Uri]$UriString
+        $hostName = $u.DnsSafeHost
+        $ips = [System.Net.Dns]::GetHostAddresses($hostName) | ForEach-Object { $_.ToString() }
+        if (-not $ips -or $ips.Count -eq 0) { return "DNS -> Host='$hostName' IPs=<none>" }
+        return ("DNS -> Host='{0}' IPs='{1}'" -f $hostName, ($ips -join ","))
+    } catch {
+        return ("DNS -> <error>: {0}" -f (Get-ExceptionText $_.Exception))
+    }
+}
+
+function Invoke-BitsDownload {
+    param(
+        [Parameter(Mandatory=$true)][string]$Source,
+        [Parameter(Mandatory=$true)][string]$Destination
+    )
+    try {
+        if (-not (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue)) { return $false }
+        Write-Log "trying BITS download..."
+        Start-BitsTransfer -Source $Source -Destination $Destination -ErrorAction Stop
+        return $true
+    } catch {
+        Write-Log ("BITS download failed: " + (Get-ExceptionText $_.Exception)) 'WARN'
+        return $false
+    }
+}
+
+# Helper: detect if Microsoft Defender is present and active
+function Test-DefenderAvailable {
+    try {
+        $svc = Get-Service -Name 'WinDefend' -ErrorAction SilentlyContinue
+        if (-not $svc) { return $false }
+        # If service is disabled/stopped permanently (e.g., 3rd-party AV), skip
+        if ($svc.Status -eq 'Stopped' -or $svc.Status -eq 'Disabled') { return $false }
+        # Ensure Defender cmdlets are operational
+        $null = Get-Command Get-MpComputerStatus -ErrorAction Stop
+        $null = Get-MpComputerStatus -ErrorAction Stop
+        return $true
+    } catch { return $false }
+}
+
+# Helper to wait until a file is readable (handles AV/Indexing locks)
+function Wait-FileReadable([string]$path, [int]$timeoutSec = 120) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt $timeoutSec) {
+        try {
+            $fs = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            $fs.Dispose()
+            return $true
+        } catch {
+            Start-Sleep -Milliseconds 500
+        }
+    }
+    return $false
+}
+
+# =========================
 # Release Source (unchanged repo/artifacts)
 # =========================
 $repo   = "Care-AI-Inc/careai-corina-service-staging-releases"
@@ -158,11 +406,13 @@ if ($corinaRegistryInstance) {
     $newTaskName    = "CorinaStagingDailyUpdater-$corinaRegistryInstance"
     $installDir     = Join-Path (Join-Path ${env:ProgramFiles} "CorinaService-Staging") $corinaRegistryInstance
     $serviceDisplayName = "Corina Service (Staging - $corinaRegistryInstance)"
+    $workDir        = Join-Path "C:\ProgramData\CorinaService-Staging" $corinaRegistryInstance
 } else {
     $newServiceName = "CorinaService-Staging"
     $newTaskName    = "CorinaStagingDailyUpdater"
     $installDir     = Join-Path ${env:ProgramFiles} "CorinaService-Staging"
     $serviceDisplayName = "Corina Service (Staging)"
+    $workDir        = "C:\ProgramData\CorinaService-Staging"
 }
 $exePath        = Join-Path $installDir $exeName
 $defaultCorinaBackendBaseUrl = "https://backend.staging.caregp.com.au"
@@ -276,7 +526,9 @@ if (-not (Test-Path $regPath)) {
 
 $tempZip    = $null
 $instanceSuffix = if ($corinaRegistryInstance) { "-$corinaRegistryInstance" } else { "" }
-$extractDir = Join-Path $env:TEMP "CorinaServiceStagingExtract$instanceSuffix"
+# Use ProgramData instead of TEMP to avoid ACL/AV issues
+$extractDir = Join-Path $workDir "Extract"
+$defenderExclusionAdded = $false
 
 try {
     # =========================
@@ -289,18 +541,135 @@ try {
 
     $zipUrl  = $zipAsset.browser_download_url
     $zipName = $zipAsset.name
+    $zipAssetApiUrl = $zipAsset.url
     $zipBaseName = [System.IO.Path]::GetFileNameWithoutExtension($zipName)
-    $tempZip = Join-Path $env:TEMP "$zipBaseName$instanceSuffix.zip"
+    New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+    $tempZip = Join-Path $workDir "$zipBaseName$instanceSuffix.zip"
     Write-Log "release asset: $zipName"
 
-    Invoke-WebRequest -Uri $zipUrl -OutFile $tempZip -UseBasicParsing -TimeoutSec 300
-    Write-Log "downloaded to $tempZip"
+    # Clean up stale ZIPs older than 1 day to prevent accumulation and lock conflicts
+    # (release assets are named corina-staging-<version>.zip). Also sweep TEMP, where
+    # older versions of this script used to download.
+    foreach ($staleDir in @($workDir, $env:TEMP)) {
+        Get-ChildItem -Path $staleDir -Filter "corina-staging-*.zip" -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+
+    # Temporarily add Defender exclusion to reduce AV locks during update
+    $defenderExclusionPath = $workDir
+    if (Test-DefenderAvailable) {
+        try {
+            Add-MpPreference -ExclusionPath $defenderExclusionPath -ErrorAction Stop
+            $defenderExclusionAdded = $true
+            Write-Log "added Defender exclusion for $defenderExclusionPath"
+        } catch {
+            Write-Log "could not add Defender exclusion: $_" 'WARN'
+        }
+    } else {
+        Write-Log "Defender not available or inactive; skipping exclusion"
+    }
 
     # =========================
-    # Prepare extraction
+    # Download (with diagnostics and BITS fallback for locked-down networks)
     # =========================
+    try {
+        Write-Log "download URL: $zipUrl"
+        Write-Log (Get-ProxyInfo $zipUrl)
+        Write-Log ("RevocationCheckEnabled: $([System.Net.ServicePointManager]::CheckCertificateRevocationList)")
+        Write-Log (Get-DnsInfo $zipUrl)
+
+        $redirect = Get-RedirectLocation -Uri $zipUrl -Headers $headers
+        if ($redirect) {
+            Write-Log "redirect location: $redirect"
+        } else {
+            Write-Log "redirect location: <none detected>"
+        }
+
+        # If CRL/OCSP is blocked on the network, Schannel revocation check can fail with a generic trust error.
+        # Allow an opt-out for diagnostics only.
+        $disableCrl = ($env:CORINA_DISABLE_CRL -eq '1')
+        $oldCrl = [System.Net.ServicePointManager]::CheckCertificateRevocationList
+        if ($disableCrl) {
+            Write-Log "CORINA_DISABLE_CRL=1 enabled. Disabling certificate revocation checks for this download." 'WARN'
+            [System.Net.ServicePointManager]::CheckCertificateRevocationList = $false
+        }
+        try {
+            # Download the final asset URL directly when a redirect is known; this also
+            # avoids any difference in redirect handling.
+            $downloadUri = if ($redirect) { $redirect } else { $zipUrl }
+            $p = @{
+                Uri             = $downloadUri
+                Headers         = $headers
+                OutFile         = $tempZip
+                UseBasicParsing = $true
+                TimeoutSec      = 300
+            }
+            try {
+                Invoke-WebRequest @p | Out-Null
+            } catch {
+                # Fallback to BITS (different network stack)
+                if (-not (Invoke-BitsDownload -Source $downloadUri -Destination $tempZip)) { throw }
+            }
+        } finally {
+            if ($disableCrl) { [System.Net.ServicePointManager]::CheckCertificateRevocationList = $oldCrl }
+        }
+        Write-Log "downloaded to $tempZip"
+    } catch {
+        # Deep diagnostics only on failure, so the success path stays quiet.
+        Write-Log "download failed for: $zipUrl" 'FAIL'
+        Write-Log "SecurityProtocol: $([System.Net.ServicePointManager]::SecurityProtocol)"
+        Write-Log (Get-ProxyInfo $zipUrl)
+        $dbg = Get-ResponseDebugInfo $_.Exception
+        if ($dbg) { Write-Log $dbg }
+        Write-Log ("RevocationCheckEnabled: $([System.Net.ServicePointManager]::CheckCertificateRevocationList)")
+        Write-Log (Get-DnsInfo $zipUrl)
+        Write-Log (Get-TlsProbeInfo $zipUrl)
+        if ($zipAssetApiUrl) {
+            $apiRedirect = Get-RedirectLocationFromGitHubAssetApi -AssetApiUrl $zipAssetApiUrl -Headers $headers
+            if ($apiRedirect.Error) { Write-Log ("asset API redirect probe error: " + $apiRedirect.Error) }
+            if ($apiRedirect.Status) { Write-Log ("asset API status: " + $apiRedirect.Status) }
+            if ($apiRedirect.Location) { Write-Log ("asset API redirect location: " + $apiRedirect.Location) }
+        }
+        if ($redirect) {
+            Write-Log "redirect location (cached): $redirect"
+            Write-Log (Get-ProxyInfo $redirect)
+            Write-Log (Get-DnsInfo $redirect)
+            Write-Log (Get-TlsProbeInfo $redirect)
+        }
+        Write-Log ("exception: " + (Get-ExceptionText $_.Exception))
+        throw
+    }
+
+    # =========================
+    # Prepare extraction (wait out AV locks, strip MOTW, retry expand)
+    # =========================
+    # Unblock downloaded ZIP to avoid MOTW propagation
+    try { Unblock-File -LiteralPath $tempZip -ErrorAction Stop } catch { }
+
+    # Wait for AV to release the ZIP, then expand with retries
+    if (-not (Wait-FileReadable $tempZip 120)) { throw "Downloaded ZIP locked too long: $tempZip" }
     if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
-    Expand-Archive -Path $tempZip -DestinationPath $extractDir
+    $expandAttempt = 0
+    while ($true) {
+        try {
+            Expand-Archive -Path $tempZip -DestinationPath $extractDir -Force
+            break
+        } catch {
+            $expandAttempt++
+            if ($expandAttempt -ge 5) { throw }
+            Start-Sleep -Seconds 2
+        }
+    }
+    # Unblock extracted files to reduce SmartScreen/AV processing
+    try { Get-ChildItem -Path $extractDir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch { }
+
+    # Wait until extracted files are readable (handle AV scans)
+    Get-ChildItem -Path $extractDir -Recurse -File | ForEach-Object {
+        if (-not (Wait-FileReadable $_.FullName 300)) {
+            Write-Log "source not readable after wait (continuing): $($_.FullName)" 'WARN'
+        }
+    }
 
     # =========================
     # Verify staged payload BEFORE touching the live install
@@ -342,7 +711,7 @@ try {
     # Back up the current install so we can roll back
     # =========================
     Write-Log "Back up current install" 'STEP'
-    $backupDir = Join-Path $env:TEMP "CorinaServiceStagingBackup$instanceSuffix"
+    $backupDir = Join-Path $workDir "Backup"
     $haveBackup = $false
     if (Test-Path $backupDir) { Remove-Item -Recurse -Force $backupDir }
     if (Test-Path $installDir) {
@@ -448,24 +817,46 @@ try {
     }
 
     # =========================
-    # Clean up temp artifacts on success: this run's zip + extracted payload, plus
-    # stale zips left by older versions (each release has a unique file name, so
-    # they accumulate in SYSTEM's temp otherwise). On failure this is skipped and
-    # the zip stays behind for diagnostics; the next successful run sweeps it up.
-    # The backup dir is intentionally kept until the next run as a manual-rollback
-    # artifact; its name is fixed, so it never accumulates.
+    # Clean up temp artifacts on success: this run's zip + extracted payload. On
+    # failure this is skipped and the zip stays behind for diagnostics; the next
+    # successful run sweeps it up (stale-zip cleanup above). The backup dir is
+    # intentionally kept until the next run as a manual-rollback artifact; its
+    # name is fixed, so it never accumulates.
     # =========================
     Remove-Item -LiteralPath $tempZip -Force -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force $extractDir -ErrorAction SilentlyContinue
-    Get-ChildItem -Path $env:TEMP -Filter "corina-staging-*.zip" -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
-        Remove-Item -Force -ErrorAction SilentlyContinue
+
+    # Remove Defender exclusion if we added it
+    if ($defenderExclusionAdded -and (Test-DefenderAvailable)) {
+        try {
+            Remove-MpPreference -ExclusionPath $defenderExclusionPath -ErrorAction Stop
+            Write-Log "removed Defender exclusion for $defenderExclusionPath"
+            $defenderExclusionAdded = $false
+        } catch {
+            Write-Log "could not remove Defender exclusion: $_" 'WARN'
+        }
+    }
 
     Write-Log "update complete: v$stagedVer deployed and service '$newServiceName' running" 'OK'
 }
 catch {
     Write-Log "Update failed: $_" 'FAIL'
     $script:updateFailed = $true
+    # Always try to start the service back up on failure (best-effort)
+    try {
+        $svcObj2 = Get-Service -Name $newServiceName -ErrorAction SilentlyContinue
+        if ($svcObj2 -and $svcObj2.Status -ne 'Running') {
+            Set-CorinaServiceEnvironment -Name $newServiceName -Instance $corinaRegistryInstance
+            Start-Service -Name $newServiceName -ErrorAction Stop
+            Write-Log "started service '$newServiceName' after failed update"
+        }
+    } catch {
+        Write-Log "failed to start service '$newServiceName' after failed update: $_" 'WARN'
+    }
+    # Attempt to remove Defender exclusion on failure as well
+    if ($defenderExclusionAdded -and (Test-DefenderAvailable)) {
+        try { Remove-MpPreference -ExclusionPath $defenderExclusionPath -ErrorAction Stop } catch { }
+    }
 }
 finally {
     $mutex.ReleaseMutex()

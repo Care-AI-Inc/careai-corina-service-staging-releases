@@ -217,6 +217,7 @@ exit 0
     }
     $taskAction   = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $taskArgument
     $principal    = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    $settings     = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew
     $desiredTimes = @("00:00", "07:00", "09:00", "11:00", "13:00", "15:00", "17:00")
 
     $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -231,14 +232,14 @@ exit 0
         $triggers = foreach ($time in $desiredTimes) {
             New-ScheduledTaskTrigger -Daily -At ([datetime]::ParseExact($time, "HH:mm", $null))
         }
-        Register-ScheduledTask -TaskName $TaskName -Action $taskAction -Trigger $triggers -Principal $principal | Out-Null
+        Register-ScheduledTask -TaskName $TaskName -Action $taskAction -Trigger $triggers -Principal $principal -Settings $settings | Out-Null
         & $Log "Scheduled task '$TaskName' created with $($desiredTimes.Count) daily triggers."
         return
     }
 
     # Task already exists (updater path): refresh the action, keep existing triggers,
     # and add any of the desired times that are missing.
-    Set-ScheduledTask -TaskName $TaskName -Action $taskAction -ErrorAction SilentlyContinue | Out-Null
+    Set-ScheduledTask -TaskName $TaskName -Action $taskAction -Settings $settings -ErrorAction SilentlyContinue | Out-Null
 
     # Extract the wall-clock time straight from the StartBoundary string
     # (e.g. "2026-07-06T07:00:00" -> "07:00"). [DateTime]::Parse is culture-sensitive

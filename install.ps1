@@ -162,6 +162,13 @@ if (Test-Path $regPath) {
     $token = (Get-ItemProperty -Path $regPath -Name "CorinaAgentToken" -ErrorAction SilentlyContinue).CorinaAgentToken
     if ([string]::IsNullOrWhiteSpace($token)) {
         Write-Warning "CorinaAgentToken is not configured. Regenerate the staging installer script before starting the service."
+        # Keep the legacy Supabase/AWS values: a machine still on an old binary needs
+        # them to keep running, and deleting them here with no token would leave it
+        # with neither auth path.
+    } else {
+        foreach ($name in @("SupabaseUrl", "SupabaseServiceKey", "SupabaseRealtimeUrl", "AWS_LOG_BUCKET", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION")) {
+            Remove-ItemProperty -Path $regPath -Name $name -ErrorAction SilentlyContinue
+        }
     }
 } else {
     Write-Warning "Registry path $regPath not found; run the generated clinic installer to configure CorinaAgentToken."
