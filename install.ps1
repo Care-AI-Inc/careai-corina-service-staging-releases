@@ -188,6 +188,25 @@ if (-not (Test-Path (Join-Path $extractDir $exeName))) {
     exit 1
 }
 
+$stagedExePath = Join-Path $extractDir $exeName
+$stagedVersionFile = Join-Path $extractDir '.version'
+if (-not (Test-Path -LiteralPath $stagedVersionFile -PathType Leaf)) {
+    Write-Error "Staged payload is missing '.version'; aborting before touching the existing install."
+    exit 1
+}
+
+$stagedFileVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($stagedExePath).FileVersion
+$stagedVersionMatch = [regex]::Match([string]$stagedFileVersion, '^(\d+\.\d+\.\d+)\.\d+$')
+if (-not $stagedVersionMatch.Success) {
+    Write-Error "Staged executable has an invalid file version '$stagedFileVersion'; aborting."
+    exit 1
+}
+$stagedReleaseVersion = (Get-Content -LiteralPath $stagedVersionFile -Raw).Trim()
+if ($stagedReleaseVersion -cne $stagedVersionMatch.Groups[1].Value) {
+    Write-Error "Staged .version '$stagedReleaseVersion' does not match executable version '$($stagedVersionMatch.Groups[1].Value)'; aborting."
+    exit 1
+}
+
 # =========================
 # Stop and remove services to ensure a clean state (idempotent)
 # =========================
@@ -222,9 +241,19 @@ if (Test-Path $installDir) {
 # =========================
 Write-Host "    -> Copying new release files into $installDir ..."
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-robocopy $extractDir $installDir /E /R:2 /W:2 /NFL /NDL /NP /NJH /NJS | Out-Null
+# /IS is required because deterministic release ZIPs use a fixed 1980 timestamp.
+# Without it, robocopy can skip a changed .version file when the old and new
+# files have the same size and timestamp.
+robocopy $extractDir $installDir /E /IS /R:2 /W:2 /NFL /NDL /NP /NJH /NJS | Out-Null
 if ($LASTEXITCODE -ge 8) {
     Write-Error "Failed to copy new files into $installDir (robocopy exit $LASTEXITCODE)."
+    exit 1
+}
+
+$installedVersionFile = Join-Path $installDir '.version'
+if (-not (Test-Path -LiteralPath $installedVersionFile -PathType Leaf) -or
+    (Get-Content -LiteralPath $installedVersionFile -Raw).Trim() -cne $stagedReleaseVersion) {
+    Write-Error "Installed .version does not match staged release version '$stagedReleaseVersion'."
     exit 1
 }
 Remove-Item -Recurse -Force $extractDir -ErrorAction SilentlyContinue

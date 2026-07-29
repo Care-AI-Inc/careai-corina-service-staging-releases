@@ -863,6 +863,21 @@ try {
         if ([string]::IsNullOrWhiteSpace($stagedVer)) { throw "no version info" }
     } catch { throw "Staged exe '$stagedExe' is not a valid executable: $_" }
 
+    # The release ZIP uses deterministic 1980 timestamps. Validate the marker by
+    # content, not metadata, so the service and heartbeat version cannot diverge.
+    $stagedVersionFile = Join-Path $extractDir '.version'
+    if (-not (Test-Path -LiteralPath $stagedVersionFile -PathType Leaf)) {
+        throw "Staged payload is missing '.version'."
+    }
+    $stagedVersionMatch = [regex]::Match([string]$stagedVer, '^(\d+\.\d+\.\d+)\.\d+$')
+    if (-not $stagedVersionMatch.Success) {
+        throw "Staged executable has an invalid file version '$stagedVer'."
+    }
+    $stagedReleaseVersion = (Get-Content -LiteralPath $stagedVersionFile -Raw).Trim()
+    if ($stagedReleaseVersion -cne $stagedVersionMatch.Groups[1].Value) {
+        throw "Staged .version '$stagedReleaseVersion' does not match executable version '$($stagedVersionMatch.Groups[1].Value)'."
+    }
+
     # 3) sanity check: a broken/partial zip often extracts to only 0-1 files
     $stagedCount = (Get-ChildItem -Path $extractDir -Recurse -File).Count
     if ($stagedCount -lt 5) { throw "Staged payload has only $stagedCount files; refusing to deploy" }
@@ -925,12 +940,18 @@ try {
     # =========================
     # Copy extracted files  new install folder (preserve ACLs)
     # =========================
-    & robocopy "$extractDir" "$installDir" * /E /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
+    # /IS is required because deterministic release ZIPs use a fixed 1980
+    # timestamp. Without it, robocopy can skip a changed .version file when the
+    # old and new files have the same size and timestamp.
+    & robocopy "$extractDir" "$installDir" * /E /IS /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
     $rc2 = $LASTEXITCODE
     if ($rc2 -ge 8) {
         if ($haveBackup) {
             Write-Log "deploy robocopy failed (exit $rc2); restoring previous version" 'FAIL'
-            & robocopy "$backupDir" "$installDir" * /MIR /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
+            # /IS matches the deploy copy: deterministic 1980 timestamps mean the
+            # backup's .version can be skipped on restore, leaving the new version
+            # string on the rolled-back binaries.
+            & robocopy "$backupDir" "$installDir" * /MIR /IS /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
             if ($svcToStop) {
                 Set-CorinaServiceEnvironment -Name $svcToStop.Name -Instance $corinaRegistryInstance
                 Start-Service -Name $svcToStop.Name -ErrorAction SilentlyContinue
@@ -942,6 +963,11 @@ try {
 
     if (-not (Test-Path $exePath)) {
         throw "Executable not found at $exePath"
+    }
+    $installedVersionFile = Join-Path $installDir '.version'
+    if (-not (Test-Path -LiteralPath $installedVersionFile -PathType Leaf) -or
+        (Get-Content -LiteralPath $installedVersionFile -Raw).Trim() -cne $stagedReleaseVersion) {
+        throw "Installed .version does not match staged release version '$stagedReleaseVersion'."
     }
     Write-Log "new files deployed to $installDir" 'OK'
 
@@ -983,7 +1009,10 @@ try {
         if ($haveBackup) {
             Write-Log "service did not stay Running after update; restoring previous version" 'FAIL'
             Stop-Service -Name $newServiceName -Force -ErrorAction SilentlyContinue
-            & robocopy "$backupDir" "$installDir" * /MIR /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
+            # /IS matches the deploy copy: deterministic 1980 timestamps mean the
+            # backup's .version can be skipped on restore, leaving the new version
+            # string on the rolled-back binaries.
+            & robocopy "$backupDir" "$installDir" * /MIR /IS /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
             Set-CorinaServiceEnvironment -Name $newServiceName -Instance $corinaRegistryInstance
             Start-Service -Name $newServiceName -ErrorAction SilentlyContinue
             throw "New build v$stagedVer failed health check; rolled back to previous version."
