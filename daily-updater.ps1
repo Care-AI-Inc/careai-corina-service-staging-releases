@@ -658,6 +658,8 @@ $instanceSuffix = if ($corinaRegistryInstance) { "-$corinaRegistryInstance" } el
 # Use ProgramData instead of TEMP to avoid ACL/AV issues
 $extractDir = Join-Path $workDir "Extract"
 $defenderExclusionAdded = $false
+$deploymentStarted = $false
+$deploymentRollbackPerformed = $false
 
 try {
     # =========================
@@ -933,6 +935,7 @@ try {
     # =========================
     # Ensure new install directory exists
     # =========================
+    $deploymentStarted = $true
     if (-not (Test-Path $installDir)) {
         New-Item -ItemType Directory -Path $installDir -Force | Out-Null
     }
@@ -940,22 +943,26 @@ try {
     # =========================
     # Copy extracted files  new install folder (preserve ACLs)
     # =========================
-    # /IS is required because deterministic release ZIPs use a fixed 1980
-    # timestamp. Without it, robocopy can skip a changed .version file when the
-    # old and new files have the same size and timestamp.
+    # /IS re-copies unchanged same-size files in general, but it is NOT reliable
+    # for the dotfile '.version' (robocopy's wildcard + fixed 1980 ZIP timestamp
+    # skip it as "Same"), so that marker is copied explicitly below.
     & robocopy "$extractDir" "$installDir" * /E /IS /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
     $rc2 = $LASTEXITCODE
     if ($rc2 -ge 8) {
         if ($haveBackup) {
             Write-Log "deploy robocopy failed (exit $rc2); restoring previous version" 'FAIL'
-            # /IS matches the deploy copy: deterministic 1980 timestamps mean the
-            # backup's .version can be skipped on restore, leaving the new version
-            # string on the rolled-back binaries.
             & robocopy "$backupDir" "$installDir" * /MIR /IS /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
+            # Restore the version marker explicitly: robocopy cannot be trusted to
+            # revert the same-size/same-timestamp '.version' dotfile, which would
+            # otherwise leave the new version string on the rolled-back binaries.
+            if (Test-Path -LiteralPath (Join-Path $backupDir '.version')) {
+                Copy-Item -LiteralPath (Join-Path $backupDir '.version') -Destination $installDir -Force -ErrorAction Stop
+            }
             if ($svcToStop) {
                 Set-CorinaServiceEnvironment -Name $svcToStop.Name -Instance $corinaRegistryInstance
                 Start-Service -Name $svcToStop.Name -ErrorAction SilentlyContinue
             }
+            $deploymentRollbackPerformed = $true
             throw "Deploy failed (robocopy exit $rc2); rolled back to previous version."
         }
         throw "Robocopy (extractinstall) failed with code $rc2"
@@ -964,6 +971,10 @@ try {
     if (-not (Test-Path $exePath)) {
         throw "Executable not found at $exePath"
     }
+    # Deterministically overwrite the version marker. robocopy cannot be trusted
+    # to re-copy the same-size/same-timestamp '.version' dotfile, so copy it
+    # explicitly to guarantee the heartbeat version matches the deployed build.
+    Copy-Item -LiteralPath (Join-Path $extractDir '.version') -Destination $installDir -Force -ErrorAction Stop
     $installedVersionFile = Join-Path $installDir '.version'
     if (-not (Test-Path -LiteralPath $installedVersionFile -PathType Leaf) -or
         (Get-Content -LiteralPath $installedVersionFile -Raw).Trim() -cne $stagedReleaseVersion) {
@@ -1009,12 +1020,16 @@ try {
         if ($haveBackup) {
             Write-Log "service did not stay Running after update; restoring previous version" 'FAIL'
             Stop-Service -Name $newServiceName -Force -ErrorAction SilentlyContinue
-            # /IS matches the deploy copy: deterministic 1980 timestamps mean the
-            # backup's .version can be skipped on restore, leaving the new version
-            # string on the rolled-back binaries.
             & robocopy "$backupDir" "$installDir" * /MIR /IS /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
+            # Restore the version marker explicitly: robocopy cannot be trusted to
+            # revert the same-size/same-timestamp '.version' dotfile, which would
+            # otherwise leave the new version string on the rolled-back binaries.
+            if (Test-Path -LiteralPath (Join-Path $backupDir '.version')) {
+                Copy-Item -LiteralPath (Join-Path $backupDir '.version') -Destination $installDir -Force -ErrorAction Stop
+            }
             Set-CorinaServiceEnvironment -Name $newServiceName -Instance $corinaRegistryInstance
             Start-Service -Name $newServiceName -ErrorAction SilentlyContinue
+            $deploymentRollbackPerformed = $true
             throw "New build v$stagedVer failed health check; rolled back to previous version."
         }
         throw "Service '$newServiceName' did not stay Running after update (no backup available to roll back)."
@@ -1046,16 +1061,56 @@ try {
 catch {
     Write-Log "Update failed: $_" 'FAIL'
     $script:updateFailed = $true
-    # Always try to start the service back up on failure (best-effort)
-    try {
-        $svcObj2 = Get-Service -Name $newServiceName -ErrorAction SilentlyContinue
-        if ($svcObj2 -and $svcObj2.Status -ne 'Running') {
+
+    # Any exception after deployment starts must restore the complete previous
+    # payload before attempting to start the service. Starting a partially copied
+    # install can leave mixed binaries and an incorrect heartbeat version.
+    if ($deploymentStarted -and $haveBackup -and -not $deploymentRollbackPerformed) {
+        try {
+            Write-Log "restoring previous version after failed deployment" 'WARN'
+            Stop-Service -Name $newServiceName -Force -ErrorAction SilentlyContinue
+            Stop-ServiceProcessByName -Name $newServiceName
+            New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+            & robocopy "$backupDir" "$installDir" * /MIR /IS /COPY:DAT /R:10 /W:5 /NFL /NDL /NP /NJH /NJS | Out-Null
+            $restoreRc = $LASTEXITCODE
+            if ($restoreRc -ge 8) {
+                throw "Rollback robocopy failed with exit $restoreRc"
+            }
+            $backupVersionFile = Join-Path $backupDir '.version'
+            if (Test-Path -LiteralPath $backupVersionFile -PathType Leaf) {
+                Copy-Item -LiteralPath $backupVersionFile -Destination $installDir -Force -ErrorAction Stop
+            }
+            if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
+                throw "Rollback did not restore the service executable"
+            }
             Set-CorinaServiceEnvironment -Name $newServiceName -Instance $corinaRegistryInstance
             Start-Service -Name $newServiceName -ErrorAction Stop
-            Write-Log "started service '$newServiceName' after failed update"
+            $restoredService = Get-Service -Name $newServiceName -ErrorAction Stop
+            if ($restoredService.Status -ne 'Running') {
+                throw "Restored service is not Running"
+            }
+            $deploymentRollbackPerformed = $true
+            Write-Log "previous version restored and service '$newServiceName' is running" 'OK'
+        } catch {
+            Write-Log "automatic rollback failed: $_" 'FAIL'
         }
-    } catch {
-        Write-Log "failed to start service '$newServiceName' after failed update: $_" 'WARN'
+    } elseif ($deploymentStarted -and -not $haveBackup) {
+        Write-Log "deployment failed without a backup; refusing to start a partial install" 'FAIL'
+    }
+
+    # If deployment never touched the live install, preserve the old best-effort
+    # restart behavior. It is not safe after a partial deployment without backup.
+    if (-not $deploymentStarted) {
+        try {
+            $svcObj2 = Get-Service -Name $newServiceName -ErrorAction SilentlyContinue
+            if ($svcObj2 -and $svcObj2.Status -ne 'Running') {
+                Set-CorinaServiceEnvironment -Name $newServiceName -Instance $corinaRegistryInstance
+                Start-Service -Name $newServiceName -ErrorAction Stop
+                Write-Log "started service '$newServiceName' after failed update"
+            }
+        } catch {
+            Write-Log "failed to start service '$newServiceName' after failed update: $_" 'WARN'
+        }
     }
     # Attempt to remove Defender exclusion on failure as well
     if ($defenderExclusionAdded -and (Test-DefenderAvailable)) {

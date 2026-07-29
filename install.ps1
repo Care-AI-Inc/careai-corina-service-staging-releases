@@ -88,7 +88,7 @@ function Set-CorinaServiceEnvironment {
         $values += "CorinaRegistryInstance=$Instance"
     }
 
-    New-ItemProperty -Path $svcRegPath -Name Environment -PropertyType MultiString -Value $values -Force | Out-Null
+    New-ItemProperty -Path $svcRegPath -Name Environment -PropertyType MultiString -Value $values -Force -ErrorAction Stop | Out-Null
 }
 
 $corinaRegistryInstance = Get-CorinaRegistryInstance
@@ -208,31 +208,33 @@ if ($stagedReleaseVersion -cne $stagedVersionMatch.Groups[1].Value) {
 }
 
 # =========================
-# Stop and remove services to ensure a clean state (idempotent)
+# Stop the existing service without deleting its registration (idempotent)
 # =========================
+$existingService = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+$serviceCreatedByInstaller = $false
+$installBackupDir = $null
+$hadExistingInstall = Test-Path -LiteralPath $installDir -PathType Container
+
+try {
 foreach ($svc in @($serviceName)) {
-    if (Get-Service -Name $svc -ErrorAction SilentlyContinue) {
+    if ($existingService) {
         Write-Host "    -> Stopping existing service..."
         Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2
-        Write-Host "    -> Deleting existing service..."
         Stop-ServiceProcessByName -Name $svc
-        sc.exe delete $svc | Out-Null
-        Start-Sleep -Seconds 2
     }
 }
 
 # =========================
-# Remove old install dir (payload already verified)
+# Move old install dir to a same-volume backup (payload already verified)
 # =========================
-if (Test-Path $installDir) {
+if ($hadExistingInstall) {
+    $installBackupDir = "{0}.install-backup-{1}" -f $installDir, ([Guid]::NewGuid().ToString('N'))
     try {
-        Write-Host "    -> Removing old install directory: $installDir"
-        Remove-Item -Recurse -Force $installDir -ErrorAction Stop
+        Write-Host "    -> Backing up old install directory to $installBackupDir"
+        Move-Item -LiteralPath $installDir -Destination $installBackupDir -ErrorAction Stop
     } catch {
-        Write-Warning "Could not fully delete $installDir, retrying in 5 seconds..."
-        Start-Sleep -Seconds 5
-        Remove-Item -Recurse -Force $installDir -ErrorAction SilentlyContinue
+        throw "Could not move the existing install into a rollback backup: $_"
     }
 }
 
@@ -241,37 +243,42 @@ if (Test-Path $installDir) {
 # =========================
 Write-Host "    -> Copying new release files into $installDir ..."
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-# /IS is required because deterministic release ZIPs use a fixed 1980 timestamp.
-# Without it, robocopy can skip a changed .version file when the old and new
-# files have the same size and timestamp.
+# /IS re-copies unchanged same-size files in general, but it is NOT reliable for
+# the dotfile '.version' (robocopy's wildcard + fixed 1980 ZIP timestamp skip it
+# as "Same"), so that marker is copied explicitly below.
 robocopy $extractDir $installDir /E /IS /R:2 /W:2 /NFL /NDL /NP /NJH /NJS | Out-Null
 if ($LASTEXITCODE -ge 8) {
-    Write-Error "Failed to copy new files into $installDir (robocopy exit $LASTEXITCODE)."
-    exit 1
+    throw "Failed to copy new files into $installDir (robocopy exit $LASTEXITCODE)."
 }
+
+# Deterministically overwrite the version marker; robocopy cannot be trusted to
+# re-copy the same-size/same-timestamp '.version' dotfile.
+Copy-Item -LiteralPath (Join-Path $extractDir '.version') -Destination $installDir -Force -ErrorAction Stop
 
 $installedVersionFile = Join-Path $installDir '.version'
 if (-not (Test-Path -LiteralPath $installedVersionFile -PathType Leaf) -or
     (Get-Content -LiteralPath $installedVersionFile -Raw).Trim() -cne $stagedReleaseVersion) {
-    Write-Error "Installed .version does not match staged release version '$stagedReleaseVersion'."
-    exit 1
+    throw "Installed .version does not match staged release version '$stagedReleaseVersion'."
 }
 Remove-Item -Recurse -Force $extractDir -ErrorAction SilentlyContinue
 
 if (-not (Test-Path $exePath)) {
-    Write-Error "Failed to find service executable at $exePath"
-    exit 1
+    throw "Failed to find service executable at $exePath"
 }
 
 # =========================
 # Register new service and configure recovery
 # =========================
 Write-Host "`n[*] Registering Windows service"
-Write-Host "    -> Creating Windows service: $serviceName"
-sc.exe create $serviceName binPath= "`"$exePath`"" start= auto obj= "LocalSystem" DisplayName= "$serviceDisplayName" | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "sc.exe create failed for '$serviceName' (exit code $LASTEXITCODE)."
-    exit 1
+if (-not (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) {
+    Write-Host "    -> Creating Windows service: $serviceName"
+    sc.exe create $serviceName binPath= "`"$exePath`"" start= auto obj= "LocalSystem" DisplayName= "$serviceDisplayName" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "sc.exe create failed for '$serviceName' (exit code $LASTEXITCODE)."
+    }
+    $serviceCreatedByInstaller = $true
+} else {
+    Write-Host "    -> Reusing existing Windows service: $serviceName"
 }
 Set-CorinaServiceEnvironment -Name $serviceName -Instance $corinaRegistryInstance
 Write-Host "    -> Set service environment: DOTNET_ENVIRONMENT=Staging"
@@ -289,10 +296,46 @@ Start-Service -Name $serviceName
 Start-Sleep -Seconds 3
 $svc = Get-Service -Name $serviceName -ErrorAction Stop
 if ($svc.Status -ne 'Running') {
-    Write-Error "Service failed to start (status: $($svc.Status)). Aborting."
-    exit 1
+    throw "Service failed to start (status: $($svc.Status)). Aborting."
 }
 Write-Host "SUCCESS: Corina Service (Staging) installed and started."
+
+# The new payload and service are healthy; the old directory is no longer
+# needed. Keep it on failure paths until this point so installation is recoverable.
+if ($installBackupDir -and (Test-Path -LiteralPath $installBackupDir)) {
+    try {
+        Remove-Item -LiteralPath $installBackupDir -Recurse -Force -ErrorAction Stop
+    } catch {
+        Write-Warning "Could not remove install backup $installBackupDir; leaving it for manual recovery: $_"
+    }
+}
+} catch {
+    Write-Error "Installation failed; restoring the previous staging installation: $_"
+    try {
+        if ($serviceCreatedByInstaller -and (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) {
+            Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+            Stop-ServiceProcessByName -Name $serviceName
+            sc.exe delete $serviceName | Out-Null
+            Start-Sleep -Seconds 2
+        }
+        if ($installBackupDir -and (Test-Path -LiteralPath $installBackupDir -PathType Container)) {
+            if (Test-Path -LiteralPath $installDir) {
+                Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction Stop
+            }
+            Move-Item -LiteralPath $installBackupDir -Destination $installDir -ErrorAction Stop
+        } elseif (-not $hadExistingInstall -and (Test-Path -LiteralPath $installDir)) {
+            Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction Stop
+        }
+        if ($existingService) {
+            Set-CorinaServiceEnvironment -Name $serviceName -Instance $corinaRegistryInstance
+            Start-Service -Name $serviceName -ErrorAction Stop
+            Write-Host "    -> Previous service restored and started."
+        }
+    } catch {
+        Write-Error "Automatic rollback failed: $_"
+    }
+    exit 1
+}
 
 # =========================
 # Scheduled Task: remove old, create new
