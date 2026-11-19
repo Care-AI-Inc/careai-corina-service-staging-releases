@@ -1,0 +1,8 @@
+# PowerShell Authenticode covers exact bytes. Never let Git normalize a script's
+# line endings on checkout/checkin. Final signing still occurs only in isolated
+# release output after every intentional substitution.
+*.ps1 -text
+*.psm1 -text
+*.yml text eol=lf
+*.md text eol=lf
+*.json text eol=lf

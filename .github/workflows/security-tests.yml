@@ -1,0 +1,25 @@
+name: Release script security tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      # actions/checkout v4.2.2, pinned so this workflow does not itself consume
+      # mutable action code.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Run static and manifest-contract tests
+        shell: powershell
+        run: |
+          $result = Invoke-Pester -Script .\tests\Security.Tests.ps1 -PassThru
+          if ($result.FailedCount -gt 0) {
+            throw "$($result.FailedCount) release security test(s) failed."
+          }

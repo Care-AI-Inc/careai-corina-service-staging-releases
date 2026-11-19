@@ -1,282 +1,109 @@
-# ensure-updater-task.ps1
-# Shared helper used by install.ps1 and daily-updater.ps1.
-# Writes the scheduled-task shim to C:\Scripts and registers/updates the
-# CorinaStagingDailyUpdater scheduled task.
+# Shared scheduled-task helper for Corina Service.
 #
-# Consumed at runtime via:
-#   irm https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-staging-releases/main/ensure-updater-task.ps1 | iex
-# which defines Ensure-CorinaStagingUpdaterTask in the caller's scope.
-#
-# Behavior switches:
-#   -ForceRecreate    : unregister an existing task and re-register it with the full
-#                       trigger set (install behavior). Without it, an existing task
-#                       gets its action refreshed and only missing triggers are added
-#                       (updater behavior).
-#   -LegacyShimPaths  : old shim files to delete once the new shim path is in use.
-#   -Log              : scriptblock taking one message string; defaults to Write-Host.
+# This is a byte-stable, Authenticode-signed release asset. Callers must verify
+# its manifest hash and signature before dot-sourcing it. It never downloads or
+# generates PowerShell code. The task performs an independent Authenticode,
+# thumbprint and CARE AI publisher preflight before invoking the installed updater.
 
-function Ensure-CorinaStagingUpdaterTask {
+Set-StrictMode -Version Latest
+
+function Ensure-CorinaUpdaterTask {
+    [CmdletBinding()]
     param(
         [string]$Instance,
-        [Parameter(Mandatory=$true)][string]$TaskName,
+        [Parameter(Mandatory)][string]$TaskName,
+        [Parameter(Mandatory)][string]$UpdateRoot,
+        [Parameter(Mandatory)][string]$RegistryPath,
         [string[]]$LegacyTaskNames = @(),
         [string[]]$LegacyShimPaths = @(),
         [switch]$ForceRecreate,
         [scriptblock]$Log = { param($Message) Write-Host "    -> $Message" }
     )
 
-    $scriptDir = "C:\Scripts"
-    if (-not (Test-Path $scriptDir)) { New-Item -ItemType Directory -Path $scriptDir | Out-Null }
-
-    $shimPath = if ($Instance) {
-        Join-Path $scriptDir "run-daily-updater-staging-$Instance.ps1"
-    } else {
-        Join-Path $scriptDir "run-daily-updater-staging.ps1"
+    if ($Instance -and $Instance -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$') {
+        throw "Invalid Corina registry instance '$Instance'."
+    }
+    if ($TaskName -notmatch '^[A-Za-z][A-Za-z0-9_-]{2,127}$') {
+        throw "Unsafe updater task name '$TaskName'."
     }
 
-    foreach ($legacyTaskName in $LegacyTaskNames | Select-Object -Unique) {
+    $updaterPath = Join-Path $UpdateRoot 'daily-updater.ps1'
+    if (-not (Test-Path -LiteralPath $updaterPath -PathType Leaf)) {
+        throw "Verified updater script is missing: $updaterPath"
+    }
+    if (-not (Test-Path -LiteralPath $RegistryPath)) {
+        throw "Corina registry path is missing: $RegistryPath"
+    }
+
+    foreach ($legacyTaskName in @($LegacyTaskNames | Select-Object -Unique)) {
         if ($legacyTaskName -and $legacyTaskName -ne $TaskName -and (Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue)) {
             & $Log "Removing legacy scheduled task: $legacyTaskName"
             Unregister-ScheduledTask -TaskName $legacyTaskName -Confirm:$false
-            Start-Sleep -Seconds 1
         }
     }
 
-    foreach ($legacyShimPath in $LegacyShimPaths | Select-Object -Unique) {
-        if ($legacyShimPath -and $legacyShimPath -ne $shimPath -and (Test-Path $legacyShimPath)) {
-            & $Log "Removing legacy updater shim: $legacyShimPath"
-            Remove-Item -LiteralPath $legacyShimPath -Force -ErrorAction SilentlyContinue
-        }
-    }
+    # The preflight is intentionally part of the task action. It executes before
+    # daily-updater.ps1 is loaded, preventing a modified on-disk updater from
+    # gaining SYSTEM execution even when the machine execution policy is permissive.
+    $quotedUpdater = $updaterPath.Replace("'", "''")
+    $quotedRegistry = $RegistryPath.Replace("'", "''")
+    $quotedInstance = if ($Instance) { $Instance.Replace("'", "''") } else { $null }
+    $instanceInvocation = if ($quotedInstance) { "& `$scriptPath -Instance '$quotedInstance'" } else { '& $scriptPath' }
 
-    # The shim runs as the scheduled task's target. It always fetches the latest
-    # daily-updater.ps1 from GitHub so clinic machines self-update without redeploying
-    # the task. Instance/environment variables are prepended per install below.
-    $shimPrefix = "`$env:DOTNET_ENVIRONMENT = 'Staging'`r`n"
-    if ($Instance) {
-        $shimPrefix = "`$env:CorinaRegistryInstance = '$Instance'`r`n$shimPrefix"
-    }
-    & $Log "Writing updater shim: $shimPath"
-    $shimContent = @'
-# run-daily-updater-staging.ps1
-# Shim run by the CorinaStagingDailyUpdater scheduled task.
-# Downloads the latest daily-updater.ps1 from GitHub and runs it in a child process.
-# Every stage is logged, and the child's exit code is propagated so Task Scheduler
-# reports a real failure code instead of always showing 0x0.
-
-$ErrorActionPreference = 'Stop'
-$_inst   = $env:CorinaRegistryInstance
-$LogPath = if ($_inst) { "C:\Scripts\corina-staging-update-log-$_inst.txt" } else { 'C:\Scripts\corina-staging-update-log.txt' }
-$Url     = 'https://raw.githubusercontent.com/Care-AI-Inc/careai-corina-service-staging-releases/main/daily-updater.ps1'
-
-# Writes a timestamped, structured entry to the update log (for scheduled runs /
-# history) and echoes installer-style output to the console (for manual runs).
-# Levels render a scannable status column in the log:
-#   STEP -> "[*] ", DETAIL -> "    -> ", OK -> "[OK] ", ERROR -> "[FAIL] ", WARN -> "[WARN] "
-function Write-Shim {
-    param(
-        [Parameter(Mandatory=$true)][string]$Message,
-        [string]$Level = 'DETAIL'
-    )
-    $prefix = switch ($Level) {
-        'STEP'  { '[*] ' }
-        'OK'    { '[OK] ' }
-        'ERROR' { '[FAIL] ' }
-        'WARN'  { '[WARN] ' }
-        default { '    -> ' }
-    }
-    try { "[$(Get-Date)] $prefix$Message" | Out-File -Append $LogPath } catch { }
-    switch ($Level) {
-        'ERROR' { Write-Host "ERROR: $Message" }
-        'WARN'  { Write-Warning $Message }
-        'OK'    { Write-Host "SUCCESS: $Message" }
-        'STEP'  { Write-Host "`n[*] $Message" }
-        default { Write-Host "    -> $Message" }
-    }
-}
-
-$instLabel = if ($_inst) { $_inst } else { '<default>' }
-# Blank line + banner so each run stands out when scanning the log.
+    $preflight = @"
+`$ErrorActionPreference='Stop';
 try {
-    "" | Out-File -Append $LogPath
-    "[$(Get-Date)] ==================== RUN START: Corina Service (Staging) daily auto-updater ====================" | Out-File -Append $LogPath
-} catch { }
-Write-Host "`n[*] Corina Service (Staging) daily auto-updater"
-Write-Shim "Shim: fetch latest daily-updater.ps1 from GitHub" 'STEP'
-Write-Shim "instance: $instLabel, user: $env:USERNAME, PS: $($PSVersionTable.PSVersion)"
-Write-Shim "update log: $LogPath"
+  `$scriptPath='$quotedUpdater';
+  `$registryPath='$quotedRegistry';
+  `$stored=@((Get-ItemProperty -LiteralPath `$registryPath -Name TrustedSignerThumbprints -ErrorAction Stop).TrustedSignerThumbprints);
+  `$allowed=@(`$stored | ForEach-Object { ([string]`$_).Replace(' ','').ToUpperInvariant() } | Where-Object { `$_ -match '^[0-9A-F]{40}$' } | Select-Object -Unique);
+  if (`$allowed.Count -eq 0 -or `$allowed.Count -ne `$stored.Count) { throw 'Trusted signer registry state is empty or invalid.' };
+  if (-not (Test-Path -LiteralPath `$scriptPath -PathType Leaf)) { throw 'Installed updater is missing.' };
+  `$signature=Get-AuthenticodeSignature -FilePath `$scriptPath;
+  if (`$signature.Status -ne 'Valid' -or -not `$signature.SignerCertificate) { throw ('Updater signature is not valid: '+`$signature.Status) };
+  `$certificate=`$signature.SignerCertificate;
+  `$thumbprint=`$certificate.Thumbprint.Replace(' ','').ToUpperInvariant();
+  if (`$thumbprint -notin `$allowed) { throw 'Updater signer thumbprint is not trusted.' };
+  `$simple=(`$certificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName,`$false) -replace '[^A-Za-z0-9]','').ToUpperInvariant();
+  if (`$simple -cne 'CAREAIPTYLTD') { throw 'Updater publisher common name mismatch.' };
+  `$subject=(([string]`$certificate.Subject) -replace '[^A-Za-z0-9=,.]','').ToUpperInvariant();
+  if (`$subject -notmatch '(?:^|,)O=CAREAIPTYLTD(?:,|$)' -or `$subject -notmatch '(?:^|,)C=AU(?:,|$)' -or `$subject -notmatch '(?:^|,)(?:SERIALNUMBER|OID.2.5.4.5)=38681904512(?:,|$)') { throw 'Updater publisher identity mismatch.' };
+  `$codeSigning=`$false; foreach (`$extension in `$certificate.Extensions) { if (`$extension.Oid.Value -eq '2.5.29.37') { `$eku=[Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]`$extension; if (`$eku.EnhancedKeyUsages | Where-Object { `$_.Value -eq '1.3.6.1.5.5.7.3.3' }) { `$codeSigning=`$true } } }; if (-not `$codeSigning) { throw 'Updater certificate lacks the code-signing EKU.' };
+  $instanceInvocation;
+  if (-not `$?) { throw 'Updater invocation failed.' };
+  exit 0;
+} catch { [Console]::Error.WriteLine('Corina updater preflight failed: '+`$_); exit 1 }
+"@ -replace "[\r\n]+", ' '
 
-# 1) Force TLS 1.2 (required for GitHub)
-try {
-    $proto = [System.Net.ServicePointManager]::SecurityProtocol
-    $tls12 = [System.Net.SecurityProtocolType]::Tls12
-    if (($proto -band $tls12) -eq 0) {
-        [System.Net.ServicePointManager]::SecurityProtocol = $proto -bor $tls12
-    }
-} catch {
-    Write-Shim "Failed to enable TLS 1.2: $_" 'WARN'
-}
+    $powershellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $taskArgument = "-NoLogo -NoProfile -NonInteractive -Command `"$preflight`""
+    $taskAction = New-ScheduledTaskAction -Execute $powershellExe -Argument $taskArgument
+    $principal = New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 100) -StartWhenAvailable
+    $desiredTimes = @('00:00', '07:00', '09:00', '11:00', '13:00', '15:00', '17:00')
+    $triggers = @($desiredTimes | ForEach-Object {
+        New-ScheduledTaskTrigger -Daily -At ([datetime]::ParseExact($_, 'HH:mm', [Globalization.CultureInfo]::InvariantCulture))
+    })
 
-# 2) Simple retry helper
-function Invoke-WithRetry {
-    param(
-        [scriptblock]$Action,
-        [int]$MaxRetries = 3,
-        [int]$DelaySec   = 5
-    )
-    $attempt = 0
-    while ($true) {
-        try {
-            $attempt++
-            return & $Action
-        } catch {
-            if ($attempt -ge $MaxRetries) { throw }
-            Start-Sleep -Seconds $DelaySec
-        }
-    }
-}
-
-# 3) Download and save the latest updater
-try {
-    $Headers = @{ 'User-Agent' = 'PowerShell/5.1 CareAI-Updater' }
-    $safeInst = if ($_inst) { $_inst } else { 'default' }
-    $TmpFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "daily-updater-staging-$safeInst.ps1")
-
-    $content = Invoke-WithRetry {
-        (Invoke-WebRequest -Uri $Url -Headers $Headers -UseBasicParsing -TimeoutSec 30).Content
-    }
-
-    if ([string]::IsNullOrWhiteSpace($content)) {
-        throw "Downloaded content is empty."
-    }
-    if ($content.Length -gt 0 -and $content[0] -eq [char]0xFEFF) {
-        $content = $content.Substring(1)
-    }
-
-    $content | Set-Content -LiteralPath $TmpFile -Encoding UTF8
-    Write-Shim "downloaded updater ($($content.Length) chars) to $TmpFile"
-    Write-Shim "Shim: updater fetched" 'OK'
-}
-catch {
-    Write-Shim "Shim: failed to fetch latest staging updater: $_" 'ERROR'
-    exit 1
-}
-
-# 4) Run the updater in a child process and propagate its exit code.
-#    A child failure (non-zero exit, AV/AppLocker block, GPO denial) does NOT throw
-#    here, so it must be detected via $LASTEXITCODE -- otherwise the scheduled task
-#    always reports 0x0 even when nothing ran.
-#    stdout/stderr are captured (and still echoed live) so that errors the updater
-#    prints to the console -- admin-check failures, parse errors, AppLocker blocks --
-#    can be written to the log on failure instead of vanishing with the process.
-try {
-    Write-Shim "Shim: run updater in a child process" 'STEP'
-    $childOutput = New-Object System.Collections.Generic.List[string]
-    $prevEAP = $ErrorActionPreference
-    # In PowerShell 5.1, 2>&1 on a native command turns stderr lines into terminating
-    # errors when ErrorActionPreference is Stop; relax it just for this invocation.
-    $ErrorActionPreference = 'Continue'
-    try {
-        & powershell -NoProfile -ExecutionPolicy Bypass -File $TmpFile 2>&1 | ForEach-Object {
-            $line = [string]$_
-            $childOutput.Add($line)
-            Write-Host $line
-        }
-        $updaterExit = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $prevEAP
-    }
-}
-catch {
-    Write-Shim "Shim: failed to start updater process: $_" 'ERROR'
-    exit 1
-}
-
-if ($null -eq $updaterExit) { $updaterExit = 1 }
-if ($updaterExit -ne 0) {
-    $tail = @($childOutput | Select-Object -Last 40)
-    if ($tail.Count -gt 0) {
-        try {
-            "[$(Get-Date)] [FAIL] Shim: updater console output (last $($tail.Count) line(s)):" | Out-File -Append $LogPath
-            $tail | ForEach-Object { "[$(Get-Date)]     |  $_" | Out-File -Append $LogPath }
-        } catch { }
-    }
-    Write-Shim "Shim: updater exited with code $updaterExit. If the updater logged nothing above, it was likely blocked before running (AV/AppLocker/GPO)." 'ERROR'
-    exit $updaterExit
-}
-
-Write-Shim "Shim: updater finished with exit code 0" 'OK'
-exit 0
-'@
-    ($shimPrefix + $shimContent) | Set-Content -Path $shimPath -Encoding UTF8
-
-    if ($Instance) {
-        # 'exit $LASTEXITCODE' is required: in -Command mode, 'exit N' inside the shim
-        # only ends the shim script, and powershell.exe would report 0/1 instead of the
-        # shim's real exit code -- Task Scheduler would then show failures as success.
-        $taskArgument = "-NoProfile -ExecutionPolicy Bypass -Command `"`$env:CorinaRegistryInstance='$Instance'; `$env:DOTNET_ENVIRONMENT='Staging'; & '$shimPath'; exit `$LASTEXITCODE`""
-    } else {
-        $taskArgument = "-NoProfile -ExecutionPolicy Bypass -File `"$shimPath`""
-    }
-    $taskAction   = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $taskArgument
-    $principal    = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-    # ExecutionTimeLimit: a run wedged behind AV file locks (or a hung download) gets
-    # killed by Task Scheduler after 100 minutes -- comfortably before the next trigger
-    # (triggers are at least 2h apart), so a wedged run never eats into the next window;
-    # the next trigger recovers via the abandoned-mutex path in daily-updater.ps1.
-    $settings     = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 100)
-    $desiredTimes = @("00:00", "07:00", "09:00", "11:00", "13:00", "15:00", "17:00")
-
-    $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if ($existingTask -and $ForceRecreate) {
+    $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($existing -and $ForceRecreate) {
         & $Log "Replacing existing scheduled task: $TaskName"
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-        Start-Sleep -Seconds 1
-        $existingTask = $null
+        $existing = $null
     }
 
-    if (-not $existingTask) {
-        $triggers = foreach ($time in $desiredTimes) {
-            New-ScheduledTaskTrigger -Daily -At ([datetime]::ParseExact($time, "HH:mm", $null))
-        }
+    if ($existing) {
+        Set-ScheduledTask -TaskName $TaskName -Action $taskAction -Trigger $triggers -Principal $principal -Settings $settings | Out-Null
+        & $Log "Scheduled task '$TaskName' action and seven triggers refreshed."
+    } else {
         Register-ScheduledTask -TaskName $TaskName -Action $taskAction -Trigger $triggers -Principal $principal -Settings $settings | Out-Null
-        & $Log "Scheduled task '$TaskName' created with $($desiredTimes.Count) daily triggers."
-        return
+        & $Log "Scheduled task '$TaskName' created with seven daily triggers."
     }
 
-    # Task already exists (updater path): refresh the action, keep existing triggers,
-    # and add any of the desired times that are missing.
-    Set-ScheduledTask -TaskName $TaskName -Action $taskAction -Settings $settings -ErrorAction SilentlyContinue | Out-Null
-
-    # Extract the wall-clock time straight from the StartBoundary string
-    # (e.g. "2026-07-06T07:00:00" -> "07:00"). [DateTime]::Parse is culture-sensitive
-    # and can fail on some locales; a failed parse used to make every desired time
-    # look missing, piling duplicate triggers onto the task on every run.
-    $existingTimes = @($existingTask.Triggers | ForEach-Object {
-        if ([string]$_.StartBoundary -match 'T(\d{2}:\d{2})') { $Matches[1] } else { $null }
-    } | Where-Object { $_ })
-
-    $uniqueTimes  = @($existingTimes | Select-Object -Unique)
-    $missingTimes = @($desiredTimes | Where-Object { $_ -notin $uniqueTimes })
-
-    if ($uniqueTimes.Count -lt $existingTimes.Count) {
-        # Duplicates accumulated from the old culture-sensitive parsing: rebuild the
-        # trigger list once with each time appearing exactly once.
-        $allTimes = @($uniqueTimes + $missingTimes | Select-Object -Unique)
-        $newTriggers = foreach ($time in $allTimes) {
-            New-ScheduledTaskTrigger -Daily -At ([datetime]::ParseExact($time, "HH:mm", $null))
+    foreach ($legacyShimPath in @($LegacyShimPaths | Select-Object -Unique)) {
+        if ($legacyShimPath -and (Test-Path -LiteralPath $legacyShimPath -PathType Leaf)) {
+            & $Log "Removing obsolete downloader shim: $legacyShimPath"
+            Remove-Item -LiteralPath $legacyShimPath -Force -ErrorAction SilentlyContinue
         }
-        Set-ScheduledTask -TaskName $TaskName -Trigger $newTriggers
-        & $Log "Rebuilt triggers for '$TaskName' to remove duplicates ($($existingTimes.Count) -> $($allTimes.Count)): $($allTimes -join ', ')"
-        return
-    }
-
-    if ($missingTimes.Count -gt 0) {
-        $newTriggers = @($existingTask.Triggers)
-        foreach ($time in $missingTimes) {
-            $newTriggers += New-ScheduledTaskTrigger -Daily -At ([datetime]::ParseExact($time, "HH:mm", $null))
-        }
-        Set-ScheduledTask -TaskName $TaskName -Trigger $newTriggers
-        & $Log "Added missing scheduled task triggers for '$TaskName': $($missingTimes -join ', ')"
     }
 }
