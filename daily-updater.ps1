@@ -437,6 +437,39 @@ function Wait-CorinaServiceHealthy {
     if (-not $healthy) { throw $FailureMessage }
 }
 
+function Start-CorinaServiceAfterFailure {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [int]$Attempts = 3,
+        [scriptblock]$Log = { param($Message) Write-Warning $Message }
+    )
+
+    $lastError = $null
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            $current = Get-Service -Name $Name -ErrorAction Stop
+            if ($current.Status -ne 'Running') {
+                Start-CorinaServiceSafely -Name $Name
+            }
+
+            # Confirm the recovered service does not immediately stop again.
+            Start-Sleep -Seconds 2
+            $current = Get-Service -Name $Name -ErrorAction Stop
+            if ($current.Status -eq 'Running') {
+                & $Log "Service '$Name' is running after the failed update."
+                return
+            }
+            throw "Service '$Name' did not remain running."
+        }
+        catch {
+            $lastError = $_
+            & $Log "Service recovery attempt $attempt of $Attempts failed: $_"
+        }
+    }
+
+    throw "Service '$Name' could not be recovered after $Attempts attempts: $lastError"
+}
+
 function Restart-CorinaServiceForHygiene {
     param([Parameter(Mandatory)][string]$Name)
     Write-CorinaLog "No new release; recycling service '$Name' in the local midnight window." STEP
@@ -769,7 +802,8 @@ try {
 
 }
 catch {
-    Write-CorinaLog "Update failed: $_" FAIL
+    $updateFailure = $_
+    Write-CorinaLog "Update failed: $updateFailure" FAIL
     if ($trustStateWritten) {
         try { New-ItemProperty -Path $regPath -Name TrustedSignerThumbprints -PropertyType MultiString -Value $trusted -Force | Out-Null }
         catch { Write-CorinaLog "Could not restore previous signer trust state: $_" WARN }
@@ -782,16 +816,18 @@ catch {
             catch { Write-CorinaLog "Could not fully stop the service before rollback; attempting restore: $_" WARN }
             Copy-CorinaTree -Source $backupDir -Destination $installDir -Mirror -VerifyContents
             Set-CorinaServiceEnvironment -Name $serviceName -RegistryInstance $corinaRegistryInstance
-            Start-CorinaServiceSafely -Name $serviceName
-            Write-CorinaLog 'Rollback completed and previous service restarted.' OK
+            Write-CorinaLog 'Rollback restored the complete previous installation.' OK
         } catch { Write-CorinaLog "Rollback failed: $_" FAIL }
-    } else {
-        try {
-            $current = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-            if ($current -and $current.Status -ne 'Running') { Start-CorinaServiceSafely -Name $serviceName }
-        } catch { }
     }
-    throw
+
+    # This must be outside the rollback try/catch. A failed backup restore must
+    # never skip the independent attempt to return the service to RUNNING.
+    try {
+        $recoveryLog = { param($Message) Write-CorinaLog $Message WARN }
+        Start-CorinaServiceAfterFailure -Name $serviceName -Log $recoveryLog
+    }
+    catch { Write-CorinaLog "CRITICAL: The service could not be restarted after the failed update: $_" FAIL }
+    throw $updateFailure
 }
 finally {
     Remove-Item -LiteralPath $stagingRoot -Recurse -Force -ErrorAction SilentlyContinue

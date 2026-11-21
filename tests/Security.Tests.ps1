@@ -275,6 +275,20 @@ Describe 'Corina release script static security policy' {
         Assert-CorinaMatch -Actual $updater -Pattern 'midnight recycle health check'
     }
 
+    It 'keeps failed-update service recovery independent from rollback success' {
+        foreach ($name in @('install.ps1','daily-updater.ps1')) {
+            $content = Get-Content -LiteralPath (Join-Path $repoRoot $name) -Raw
+            Assert-CorinaMatch -Actual $content -Pattern 'function Start-CorinaServiceAfterFailure'
+            Assert-CorinaMatch -Actual $content -Pattern '\[int\]\$Attempts = 3'
+
+            $rollbackIndex = $content.LastIndexOf('Copy-CorinaTree -Source $backupDir -Destination $installDir -Mirror -VerifyContents')
+            $recoveryIndex = $content.LastIndexOf('Start-CorinaServiceAfterFailure -Name $serviceName')
+            if ($rollbackIndex -lt 0 -or $recoveryIndex -lt 0 -or $recoveryIndex -lt $rollbackIndex) {
+                throw "$name must attempt service recovery after and independently from rollback."
+            }
+        }
+    }
+
     It 'preflights the updater before the SYSTEM task invokes it' {
         $helper = Get-Content -LiteralPath (Join-Path $repoRoot 'ensure-updater-task.ps1') -Raw
         Assert-CorinaMatch -Actual $helper -Pattern 'Get-AuthenticodeSignature'

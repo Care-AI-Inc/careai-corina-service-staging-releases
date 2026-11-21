@@ -515,6 +515,39 @@ function Start-CorinaServiceSafely {
     throw "Service '$Name' did not reach RUNNING after sc.exe start returned exit $requestExitCode."
 }
 
+function Start-CorinaServiceAfterFailure {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [int]$Attempts = 3,
+        [scriptblock]$Log = { param($Message) Write-Warning $Message }
+    )
+
+    $lastError = $null
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            $current = Get-Service -Name $Name -ErrorAction Stop
+            if ($current.Status -ne 'Running') {
+                Start-CorinaServiceSafely -Name $Name
+            }
+
+            # Confirm the recovered service does not immediately stop again.
+            Start-Sleep -Seconds 2
+            $current = Get-Service -Name $Name -ErrorAction Stop
+            if ($current.Status -eq 'Running') {
+                & $Log "Service '$Name' is running after the failed installation."
+                return
+            }
+            throw "Service '$Name' did not remain running."
+        }
+        catch {
+            $lastError = $_
+            & $Log "Service recovery attempt $attempt of $Attempts failed: $_"
+        }
+    }
+
+    throw "Service '$Name' could not be recovered after $Attempts attempts: $lastError"
+}
+
 function New-CorinaUpdaterMutex {
     param([Parameter(Mandatory)][string]$Name)
     $security = New-Object Security.AccessControl.MutexSecurity
@@ -620,7 +653,6 @@ $stagingRoot = Join-Path $stateRoot ("Staging\" + [guid]::NewGuid().ToString('N'
 $extractDir = Join-Path $stagingRoot 'service'
 $backupDir = Join-Path $stateRoot 'Backup'
 $existingService = $false
-$serviceWasStopped = $false
 $haveBackup = $false
 $previousRegistryTrusted = @()
 $trustStateWritten = $false
@@ -738,7 +770,6 @@ try {
     if ($existingService) {
         Write-Host '[*] Stopping the existing service'
         Stop-CorinaServiceSafely -Name $serviceName
-        $serviceWasStopped = $true
     }
 
     Write-Host '[*] Deploying verified service and update files'
@@ -825,7 +856,8 @@ try {
 
 }
 catch {
-    Microsoft.PowerShell.Utility\Write-Error "Secure installation failed: $_" -ErrorAction Continue
+    $installationFailure = $_
+    Microsoft.PowerShell.Utility\Write-Error "Secure installation failed: $installationFailure" -ErrorAction Continue
     if ($trustStateWritten) {
         try {
             if ($previousRegistryTrusted.Count -gt 0) {
@@ -843,7 +875,6 @@ catch {
             Copy-CorinaTree -Source $backupDir -Destination $installDir -Mirror -VerifyContents
             if ($existingService) {
                 Set-CorinaServiceEnvironment -Name $serviceName -RegistryInstance $corinaRegistryInstance
-                Start-CorinaServiceSafely -Name $serviceName
             }
         } catch { Write-Warning "Rollback also encountered an error: $_" }
     } elseif (-not $existingService) {
@@ -855,10 +886,15 @@ catch {
                 Write-Warning "Could not remove failed new service '$serviceName' (exit $LASTEXITCODE)."
             }
         } catch { Write-Warning "Could not remove failed new service '$serviceName': $_" }
-    } elseif ($serviceWasStopped) {
-        try { Start-CorinaServiceSafely -Name $serviceName } catch { }
     }
-    throw
+
+    # Keep recovery independent from rollback. Even if restoring the backup
+    # throws, an existing clinic service must still get a bounded restart attempt.
+    if ($existingService) {
+        try { Start-CorinaServiceAfterFailure -Name $serviceName }
+        catch { Write-Warning "CRITICAL: The existing service could not be restarted after installation failed: $_" }
+    }
+    throw $installationFailure
 }
 finally {
     Remove-Item -LiteralPath $stagingRoot -Recurse -Force -ErrorAction SilentlyContinue
